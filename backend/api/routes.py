@@ -103,6 +103,33 @@ async def cancel_run():
     return {"cancelled": cancelled}
 
 
+@router.get("/history")
+async def history(limit: int = 100, offset: int = 0, q: str = ""):
+    from db.history import HistoryDB
+    db = HistoryDB(settings.db_csv_path, settings.exports_dir_path)
+    if q:
+        records = db.search_records(q, limit)
+    else:
+        records = db.recent_records(limit, offset)
+    return {"total": db.total_count(), "records": records}
+
+
+@router.get("/exports")
+async def list_exports():
+    from db.history import HistoryDB
+    db = HistoryDB(settings.db_csv_path, settings.exports_dir_path)
+    return {"exports": db.list_exports()}
+
+
+@router.get("/exports/download")
+async def download_export(path: str):
+    requested = Path(path).resolve()
+    export_root = settings.exports_dir_path.resolve()
+    if export_root not in requested.parents or not requested.is_file():
+        raise HTTPException(status_code=404, detail="Export file not found")
+    return FileResponse(requested, media_type="text/csv", filename=requested.name)
+
+
 @router.get("/runs/file")
 async def run_file(path: str):
     requested = Path(path).resolve()

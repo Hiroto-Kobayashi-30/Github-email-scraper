@@ -70,6 +70,51 @@ class HistoryDB:
         with self.db_csv_path.open("r", newline="", encoding="utf-8") as f:
             return max(0, sum(1 for _ in csv.reader(f)) - 1)
 
+    def recent_records(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Return the most recently appended history records (newest first)."""
+        if not self.db_csv_path.exists():
+            return []
+        with self._lock:
+            with self.db_csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+        rows.reverse()
+        return rows[offset:offset + limit]
+
+    def search_records(self, query: str, limit: int = 100) -> list[dict]:
+        """Case-insensitive substring search across username and email."""
+        if not self.db_csv_path.exists():
+            return []
+        q = query.strip().lower()
+        if not q:
+            return self.recent_records(limit)
+        with self._lock:
+            with self.db_csv_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+        matched = [
+            r for r in rows
+            if q in (r.get("username") or "").lower()
+            or q in (r.get("email") or "").lower()
+        ]
+        matched.reverse()
+        return matched[:limit]
+
+    def list_exports(self) -> list[dict]:
+        """List all export CSV files with relative paths and sizes."""
+        exports: list[dict] = []
+        if not self.exports_dir.exists():
+            return exports
+        for path in sorted(self.exports_dir.rglob("*.csv"), reverse=True):
+            stat = path.stat()
+            exports.append({
+                "path": str(path),
+                "name": path.name,
+                "size_bytes": stat.st_size,
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+        return exports
+
     def run_export_path(self, location: str, target_count: int, run_id: str | None = None) -> Path:
         now = datetime.now()
         run_id = run_id or now.strftime("%Y%m%d_%H%M%S_%f")
