@@ -119,5 +119,3 @@ export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Prop
     </div>
   )
 }
-
-}
