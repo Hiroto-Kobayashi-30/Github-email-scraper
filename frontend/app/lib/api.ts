@@ -67,13 +67,13 @@ export const apiBase = API
 
 export async function fetchProgress(): Promise<Progress> {
   const r = await fetch(`${API}/api/runs/current`, { cache: 'no-store' })
-  if (!r.ok) throw new Error('Failed to fetch current run')
+  if (!r.ok) throw new Error('plz run the backend locally : Failed to fetch current run')
   return r.json()
 }
 
 export async function fetchStats(): Promise<{ historical_records: number; run: Progress }> {
   const r = await fetch(`${API}/api/stats`, { cache: 'no-store' })
-  if (!r.ok) throw new Error('Failed to fetch stats')
+  if (!r.ok) throw new Error('plz run the backend locally : Failed to fetch stats')
   return r.json()
 }
 
@@ -98,13 +98,13 @@ export async function fetchHistory(limit = 100, offset = 0, q = ''): Promise<{ t
   const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
   if (q) params.set('q', q)
   const r = await fetch(`${API}/api/history?${params}`, { cache: 'no-store' })
-  if (!r.ok) throw new Error('Failed to fetch history')
+  if (!r.ok) throw new Error('plz run the backend locally : Failed to fetch history')
   return r.json()
 }
 
 export async function fetchExports(): Promise<{ exports: ExportEntry[] }> {
   const r = await fetch(`${API}/api/exports`, { cache: 'no-store' })
-  if (!r.ok) throw new Error('Failed to fetch exports')
+  if (!r.ok) throw new Error('plz run the backend locally : Failed to fetch exports')
   return r.json()
 }
 
@@ -136,6 +136,6 @@ export type TokenStatus = {
 
 export async function fetchTokenStatus(): Promise<{ tokens: TokenStatus[] }> {
   const r = await fetch(`${API}/api/tokens/status`, { cache: 'no-store' })
-  if (!r.ok) throw new Error('Failed to fetch token status')
+  if (!r.ok) throw new Error('plz run the backend locally : Failed to fetch token status')
   return r.json()
 }
