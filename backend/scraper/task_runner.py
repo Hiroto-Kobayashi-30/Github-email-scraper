@@ -65,6 +65,9 @@ class TaskRunner:
         self.on_progress = on_progress
         self.progress = RunProgress()
         self._started_mono = 0.0
+        # Guards the dedup-check + CSV-write step shared by all workers.
+        self._save_lock = asyncio.Lock()
+        self._stop = asyncio.Event()
 
     def _emit(self) -> None:
         self.progress.elapsed_seconds = round(monotonic() - self._started_mono, 2) if self._started_mono else 0
@@ -104,35 +107,78 @@ class TaskRunner:
         self.progress.run_csv = str(run_path)
         self._emit()
 
-        try:
-            async for user in self.discovery.stream_users(location, start_year, end_year):
-                if (
-                    self.progress.extracted >= target_count
-                    or self.progress.scanned_users >= max_scanned_users
-                ):
-                    break
-                self.progress.scanned_users += 1
-                login = user.get("login")
-                self.progress.current_username = login
-                self.progress.current_stage = "repository_filter"
-                self._emit()
-                if not login:
-                    self.progress.skipped += 1
-                    continue
+        workers_count = max(1, settings.max_concurrent_users)
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=workers_count * 2)
+        self._stop = asyncio.Event()
 
-                ok, reason = passes_initial_filter(user, min_repos, max_repos)
-                if not ok:
-                    self.progress.skipped += 1
-                    if reason == "repo_count_out_of_range":
-                        self.progress.skipped_repo_range += 1
+        def limits_reached() -> bool:
+            return (
+                self.progress.extracted >= target_count
+                or self.progress.scanned_users >= max_scanned_users
+            )
+
+        async def producer() -> None:
+            """Feeds the bounded queue; back-pressure keeps memory flat."""
+            try:
+                async for user in self.discovery.stream_users(location, start_year, end_year):
+                    if self._stop.is_set() or limits_reached():
+                        break
+                    self.progress.scanned_users += 1
+                    login = user.get("login")
+                    self.progress.current_username = login
+                    self.progress.current_stage = "repository_filter"
                     self._emit()
-                    continue
+                    if not login:
+                        self.progress.skipped += 1
+                        continue
 
-                await self._process_user(login, user, run_path, strict_quality_gmail)
+                    ok, reason = passes_initial_filter(user, min_repos, max_repos)
+                    if not ok:
+                        self.progress.skipped += 1
+                        if reason == "repo_count_out_of_range":
+                            self.progress.skipped_repo_range += 1
+                        self._emit()
+                        continue
+
+                    await queue.put(user)
+            finally:
+                self._stop.set()
+
+        async def worker() -> None:
+            while True:
+                if self._stop.is_set() and queue.empty():
+                    return
+                try:
+                    user = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    if self.progress.extracted >= target_count:
+                        continue
+                    login = user.get("login")
+                    self.progress.current_username = login
+                    await self._process_user(login, user, run_path, strict_quality_gmail)
+                    if self.progress.extracted >= target_count:
+                        self._stop.set()
+                finally:
+                    queue.task_done()
+
+        tasks: list[asyncio.Task] = []
+        try:
+            producer_task = asyncio.create_task(producer())
+            tasks = [asyncio.create_task(worker()) for _ in range(workers_count)]
+            await producer_task
+            await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             self.progress.status = "cancelled"
+            for task in tasks:
+                task.cancel()
             raise
         except Exception as exc:
+            self._stop.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             self.progress.status = "failed"
             self.progress.errors += 1
             self.progress.last_error = str(exc)
@@ -281,34 +327,37 @@ class TaskRunner:
 
         started = monotonic()
 
-        if self.dedup.contains(email):
+        # One writer at a time: workers run concurrently, so the duplicate
+        # check and the write must be a single atomic step.
+        async with self._save_lock:
+            if self.dedup.contains(email):
+                self.progress.dedup_seconds += monotonic() - started
+                self.progress.skipped += 1
+                self.progress.skipped_duplicate += 1
+                self._emit()
+                return
+
             self.progress.dedup_seconds += monotonic() - started
-            self.progress.skipped += 1
-            self.progress.skipped_duplicate += 1
-            self._emit()
-            return
 
-        self.progress.dedup_seconds += monotonic() - started
+            # ----------------------------------------------------------
+            # Save result
+            # ----------------------------------------------------------
 
-        # --------------------------------------------------------------
-        # Save result
-        # --------------------------------------------------------------
+            now = datetime.now(timezone.utc).isoformat()
 
-        now = datetime.now(timezone.utc).isoformat()
+            record = {
+                "username": login,
+                "email": email,
+                "github_username": login,
+                "account_creation_year": created_year,
+                "first_commit_year": first_year,
+                "run_id": self.progress.run_id,
+                "scraped_at": now,
+            }
 
-        record = {
-            "username": login,
-            "email": email,
-            "github_username": login,
-            "account_creation_year": created_year,
-            "first_commit_year": first_year,
-            "run_id": self.progress.run_id,
-            "scraped_at": now,
-        }
-
-        self.history.append_to_db(record)
-        self.history.append_to_run(run_path, record)
-        self.dedup.add(email)
+            self.history.append_to_db(record)
+            self.history.append_to_run(run_path, record)
+            self.dedup.add(email)
 
         self.progress.extracted += 1
 

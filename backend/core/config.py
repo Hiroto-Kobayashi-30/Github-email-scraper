@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     github_tokens: str = ""
     api_host: str = "127.0.0.1"
     api_port: int = 8000
+    max_concurrent_users: int = 8
     max_concurrent_profiles: int = 8
     profile_request_delay_ms: int = 250
     repo_scan_limit: int = 100000
