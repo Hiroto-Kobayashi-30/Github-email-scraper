@@ -1,18 +1,27 @@
 # GitHub Email Scraper
 
-Production-oriented GitHub profile scraper with a live Next.js dashboard and FastAPI backend.
+Production-oriented GitHub profile email scraper with a Next.js dashboard and FastAPI backend.
+
+## Important year behavior
+
+The UI has **two year boxes** because they are the **account-creation search range**:
+
+- `Account creation year from`
+- `Account creation year to`
+
+They can span multiple years (for example `2015` through `2026`). This is **not** sent as a multi-year GitHub contribution `from`/`to` window.
+
+For the first-commit rule, GitHub's contribution API is queried in individual calendar-year windows. Each internal `from`/`to` window is safely less than one year, so GitHub's one-year limitation is not violated.
 
 ## Pipeline
 
-1. User chooses location, repository-count range, account-creation year range, and target count.
-2. GitHub user search is sliced by account-creation year to avoid the search-result ceiling.
-3. Users outside the repository range are skipped.
-4. The public GitHub profile page is inspected for a visible email.
-5. Only `@gmail.com` addresses continue. The optional quality gate rejects role-style addresses.
-6. The user's earliest observable commit year is calculated across owned repositories by asking GitHub for the oldest matching commit on each default branch.
-7. The rule is `account_creation_year - first_commit_year < 4`.
-8. Previously collected Gmail addresses are skipped using the permanent `data/db.csv` history.
-9. Accepted records are appended to `db.csv` and to a unique per-run CSV export.
+1. Search GitHub users by location and account-creation year, one creation year at a time.
+2. Read the user's public profile email directly from GraphQL; no HTML profile scraping.
+3. Keep only Gmail addresses (with optional quality filtering).
+4. Deduplicate the Gmail address **before** contribution-history queries.
+5. Check commit contributions for the four calendar years beginning with the account creation year.
+6. Accept when `account_creation_year - first_commit_year < 4`.
+7. Append accepted records to `data/db.csv` and the current run CSV.
 
 ## Run locally
 
@@ -24,8 +33,8 @@ python -m venv .venv
 # Windows: .venv\\Scripts\\activate
 # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
-# add your own GitHub token(s) to .env
+copy .env.example .env
+# put your own GitHub token(s) into backend/.env
 uvicorn main:app --reload --port 8000
 ```
 
@@ -39,11 +48,9 @@ npm run dev
 
 Open `http://localhost:3000`.
 
-## Data
+## Token permissions
 
-- `data/db.csv` is the append-only permanent history.
-- Each scrape creates a unique CSV under `data/exports/MM-DD-YYYY/<location>/`.
-- Never commit `backend/.env` or GitHub tokens.
+The GraphQL `User.email` field requires an appropriate token scope. For a classic PAT, grant `read:user` and/or `user:email`.
 
 ## Tests
 

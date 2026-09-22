@@ -1,33 +1,23 @@
-"""Discover GitHub users by location and account-creation year.
+"""Find the earliest observable commit year without repository enumeration.
 
-The UI's ``start_year``/``end_year`` are ACCOUNT CREATION years. They are
-not GraphQL contribution ``from``/``to`` dates, so users may select any
-multi-year search range.
+GitHub limits a ContributionsCollection time window to at most one year.
+The scraper therefore makes one one-year query per candidate year. The
+business rule only needs to know whether the first commit is within four
+calendar years of account creation, so at most four contribution queries
+are needed per candidate.
 """
 import asyncio
-from typing import AsyncIterator
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
-USER_SEARCH_QUERY = """
-query($q: String!, $cursor: String, $pageSize: Int!) {
-  search(query: $q, type: USER, first: $pageSize, after: $cursor) {
-    userCount
-    pageInfo { hasNextPage endCursor }
-    nodes {
-      ... on User {
-        id
-        login
-        name
-        email
-        createdAt
-        location
-        repositories(ownerAffiliations: OWNER) {
-          totalCount
-        }
-      }
+COMMIT_YEAR_QUERY = """
+query($login: String!, $from: DateTime!, $to: DateTime!) {
+  user(login: $login) {
+    contributionsCollection(from: $from, to: $to) {
+      totalCommitContributions
     }
   }
   rateLimit { remaining resetAt limit cost }
@@ -35,7 +25,20 @@ query($q: String!, $cursor: String, $pageSize: Int!) {
 """
 
 
-class Discovery:
+def _safe_year_window(year: int) -> tuple[str, str]:
+    """Return a strictly-less-than-one-year UTC window for one calendar year."""
+    start = datetime(year, 1, 1, tzinfo=timezone.utc)
+    end_exclusive = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    # End one second before the next calendar year. This avoids an accidental
+    # >1-year span while still covering the complete requested calendar year.
+    end = end_exclusive - timedelta(seconds=1)
+    return (
+        start.isoformat().replace("+00:00", "Z"),
+        end.isoformat().replace("+00:00", "Z"),
+    )
+
+
+class ContributionExtractor:
     def __init__(self, rate_limiter):
         self.rate_limiter = rate_limiter
         self.client = httpx.AsyncClient(timeout=60.0)
@@ -43,15 +46,14 @@ class Discovery:
     async def aclose(self) -> None:
         await self.client.aclose()
 
-    async def _post(self, query: str, variables: dict) -> dict:
+    async def _post(self, variables: dict) -> dict:
         last_error = None
-
         for attempt in range(5):
             token = await self.rate_limiter.wait_if_needed()
             try:
                 response = await self.client.post(
                     GRAPHQL_URL,
-                    json={"query": query, "variables": variables},
+                    json={"query": COMMIT_YEAR_QUERY, "variables": variables},
                     headers={
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/json",
@@ -69,10 +71,8 @@ class Discovery:
                     raise RuntimeError(last_error)
 
                 if response.status_code in (403, 429):
-                    await self.rate_limiter.release()
-                    delay = self.rate_limiter.retry_delay(response.headers, attempt)
                     last_error = f"GitHub throttled request with HTTP {response.status_code}"
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(self.rate_limiter.retry_delay(response.headers, attempt))
                     continue
 
                 if response.status_code in (500, 502, 503, 504):
@@ -88,40 +88,31 @@ class Discovery:
                 if errors:
                     message = errors[0].get("message", "GraphQL error")
                     lower = message.lower()
-                    if "rate limit" in lower or "secondary rate" in lower or "abuse" in lower:
+                    if "rate limit" in lower or "secondary rate" in lower or "abuse" in lower or "timeout" in lower:
                         last_error = message
                         await asyncio.sleep(min(2 ** attempt, 16))
                         continue
                     raise RuntimeError(f"GraphQL error: {errors}")
                 return payload["data"]
-
             except httpx.TimeoutException as exc:
                 await self.rate_limiter.release()
                 last_error = f"Timeout: {exc}"
                 await asyncio.sleep(min(2 ** attempt, 16))
 
-        raise RuntimeError(f"GitHub discovery failed after 5 attempts. Last error: {last_error}")
+        raise RuntimeError(f"Contribution query failed after 5 attempts. Last error: {last_error}")
 
-    async def stream_users(self, location: str, start_year: int, end_year: int) -> AsyncIterator[dict]:
-        """Yield users matching location, one ACCOUNT-CREATION year at a time.
+    async def first_commit_year(self, login: str, account_created_year: int) -> int | None:
+        """Return the first year with a visible GitHub commit contribution.
 
-        This slicing is intentionally independent of the one-year limitation
-        on contribution/commit GraphQL queries.
+        Only years account_created_year through account_created_year + 3 are
+        needed for the project's ``difference < 4`` acceptance rule.
         """
-        for year in range(start_year, end_year + 1):
-            q = f'location:"{location}" type:user created:{year}-01-01..{year}-12-31'
-            cursor = None
-            while True:
-                data = await self._post(
-                    USER_SEARCH_QUERY,
-                    {"q": q, "cursor": cursor, "pageSize": 100},
-                )
-                search = data["search"]
-                for node in search["nodes"]:
-                    if node:
-                        yield node
-                page = search["pageInfo"]
-                if not page["hasNextPage"]:
-                    break
-                cursor = page["endCursor"]
-                await asyncio.sleep(0.25)
+        for year in range(account_created_year, account_created_year + 4):
+            from_ts, to_ts = _safe_year_window(year)
+            data = await self._post({"login": login, "from": from_ts, "to": to_ts})
+            collection = (data.get("user") or {}).get("contributionsCollection")
+            if not collection:
+                return None
+            if int(collection.get("totalCommitContributions") or 0) > 0:
+                return year
+        return None

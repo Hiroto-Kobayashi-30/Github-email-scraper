@@ -13,11 +13,8 @@ class Settings(BaseSettings):
     github_tokens: str = ""
     api_host: str = "127.0.0.1"
     api_port: int = 8000
-    max_concurrent_users: int = 8
-    max_concurrent_profiles: int = 8
-    profile_request_delay_ms: int = 250
-    repo_scan_limit: int = 100000
-    max_concurrent_repos: int = 5
+    max_concurrent_graphql: int = 4
+    graphql_points_per_minute: int = 1600
     data_dir: str = "../data"
     db_csv: str = "../data/db.csv"
     exports_dir: str = "../data/exports"

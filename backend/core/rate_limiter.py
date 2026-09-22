@@ -1,4 +1,4 @@
-"""Per-token GitHub GraphQL rate-limit and authentication management."""
+"""Conservative GitHub GraphQL rate and concurrency limiter."""
 import asyncio
 import time
 from dataclasses import dataclass
@@ -11,96 +11,111 @@ class RateState:
     limit: int = 5000
     invalid: bool = False
 
-    @property
-    def exhausted(self) -> bool:
-        return self.remaining <= 0
-
 
 class RateLimiter:
-    """Select a usable token and rotate away from exhausted/invalid tokens."""
+    """Serialize token selection and reserve primary/secondary capacity.
 
-    def __init__(self, floor: int = 500, tokens: list[str] | None = None):
-        cleaned = [t.strip().strip('"').strip("'") for t in (tokens or []) if t.strip()]
-        self.tokens = cleaned
+    The limiter deliberately keeps GraphQL concurrency low and spaces requests
+    so multiple workers cannot all observe the same stale primary-limit value.
+    """
+
+    def __init__(self, floor: int = 500, tokens: list[str] | None = None,
+                 max_concurrent: int = 4, points_per_minute: int = 1600):
+        self.tokens = [t.strip().strip('"').strip("'") for t in (tokens or []) if t.strip()]
         self.floor = max(0, floor)
+        self.max_concurrent = max(1, max_concurrent)
+        self.points_per_minute = max(1, points_per_minute)
         self.states = [RateState() for _ in self.tokens]
         self._index = 0
         self._lock = asyncio.Lock()
+        self._concurrency = asyncio.Semaphore(self.max_concurrent)
+        self._minute_lock = asyncio.Lock()
+        self._window_started = time.monotonic()
+        self._window_points = 0
 
     @property
     def token_count(self) -> int:
         return len(self.tokens)
 
-    def current_token(self) -> str:
-        if not self.tokens:
-            return ""
-        return self.tokens[self._index]
-
-    def snapshot(self) -> dict:
-        if not self.tokens:
-            return {"token_index": -1, "token_count": 0, "remaining": 0, "limit": 0, "reset_at": 0}
-        state = self.states[self._index]
-        return {
-            "token_index": self._index,
-            "token_count": len(self.tokens),
-            "remaining": state.remaining,
-            "limit": state.limit,
-            "reset_at": state.reset_at,
-            "invalid": state.invalid,
-        }
+    async def _reserve_secondary_budget(self, estimated_points: int = 10) -> None:
+        while True:
+            async with self._minute_lock:
+                now = time.monotonic()
+                elapsed = now - self._window_started
+                if elapsed >= 60:
+                    self._window_started = now
+                    self._window_points = 0
+                if self._window_points + estimated_points <= self.points_per_minute:
+                    self._window_points += estimated_points
+                    return
+                wait = max(0.05, 60 - elapsed)
+            await asyncio.sleep(min(wait, 5.0))
 
     async def acquire(self) -> str:
         if not self.tokens:
-            raise RuntimeError(
-                "No GitHub tokens configured. Set GITHUB_TOKENS in backend/.env."
-            )
-        while True:
-            async with self._lock:
-                now = time.time()
-                available = [
-                    i for i, state in enumerate(self.states)
-                    if not state.invalid and (state.remaining > self.floor or state.reset_at <= now)
-                ]
-                if available:
+            raise RuntimeError("No GitHub tokens configured. Set GITHUB_TOKENS in backend/.env.")
+        await self._concurrency.acquire()
+        try:
+            while True:
+                async with self._lock:
+                    now = time.time()
                     for offset in range(len(self.tokens)):
                         idx = (self._index + offset) % len(self.tokens)
-                        if idx in available:
+                        state = self.states[idx]
+                        if not state.invalid and (state.remaining > self.floor or state.reset_at <= now):
                             self._index = idx
-                            return self.tokens[idx]
+                            break
+                    else:
+                        usable = [s.reset_at for s in self.states if not s.invalid]
+                        if not usable:
+                            raise RuntimeError("All configured GitHub tokens are invalid or unauthorized.")
+                        wait = max(1.0, min(usable) - now + 1.0)
+                        idx = None
+                if idx is not None:
+                    await self._reserve_secondary_budget(10)
+                    return self.tokens[idx]
+                await asyncio.sleep(min(wait, 60.0))
+        except Exception:
+            self._concurrency.release()
+            raise
 
-                usable = [s.reset_at for s in self.states if not s.invalid]
-                if not usable:
-                    raise RuntimeError(
-                        "All configured GitHub tokens are invalid or unauthorized. "
-                        "Create valid classic tokens and give them the public_repo scope."
-                    )
-                reset_at = min(usable)
-                wait = max(1.0, reset_at - now + 1.0)
-            await asyncio.sleep(min(wait, 60.0))
+    async def release(self) -> None:
+        self._concurrency.release()
+
+    async def wait_if_needed(self) -> str:
+        return await self.acquire()
 
     def update_from_headers(self, headers, token: str | None = None) -> None:
         if not self.tokens:
             return
-        if token is None:
+        try:
+            idx = self.tokens.index(token) if token is not None else self._index
+        except ValueError:
             idx = self._index
-        else:
-            try:
-                idx = self.tokens.index(token)
-            except ValueError:
-                idx = self._index
         state = self.states[idx]
-        remaining = headers.get("x-ratelimit-remaining")
+        if headers.get("x-ratelimit-remaining") is not None:
+            state.remaining = int(headers["x-ratelimit-remaining"])
+        if headers.get("x-ratelimit-reset") is not None:
+            state.reset_at = float(headers["x-ratelimit-reset"])
+        if headers.get("x-ratelimit-limit") is not None:
+            state.limit = int(headers["x-ratelimit-limit"])
+
+    def retry_delay(self, headers, attempt: int) -> float:
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(1.0, min(float(retry_after), 120.0))
+            except ValueError:
+                pass
         reset = headers.get("x-ratelimit-reset")
-        limit = headers.get("x-ratelimit-limit")
-        if remaining is not None:
-            state.remaining = int(remaining)
-        if reset is not None:
-            state.reset_at = float(reset)
-        if limit is not None:
-            state.limit = int(limit)
+        if reset:
+            try:
+                return max(1.0, min(float(reset) - time.time() + 1, 120.0))
+            except ValueError:
+                pass
+        return min(2 ** attempt, 30.0)
 
     async def mark_invalid(self, token: str) -> bool:
-        """Mark a token unauthorized and rotate to another token if available."""
         async with self._lock:
             try:
                 idx = self.tokens.index(token)
@@ -113,16 +128,3 @@ class RateLimiter:
                     self._index = candidate
                     return True
             return False
-
-    async def wait_if_needed(self) -> str:
-        return await self.acquire()
-
-    async def rotate_if_low(self) -> None:
-        if not self.tokens:
-            return
-        async with self._lock:
-            for offset in range(1, len(self.tokens) + 1):
-                idx = (self._index + offset) % len(self.tokens)
-                if not self.states[idx].invalid and self.states[idx].remaining > self.floor:
-                    self._index = idx
-                    return

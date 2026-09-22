@@ -80,11 +80,11 @@ export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Prop
           <input type="number" min={1} value={form.target_count} onChange={e => set('target_count', +e.target.value)} />
         </label>
         <label>
-          Account years from
+          Account creation year from
           <input type="number" min={2008} value={form.start_year} onChange={e => set('start_year', +e.target.value)} />
         </label>
         <label>
-          Account years to
+          Account creation year to
           <input type="number" min={2008} value={form.end_year} onChange={e => set('end_year', +e.target.value)} />
         </label>
         <label className="wide">
@@ -114,7 +114,9 @@ export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Prop
         )}
       </div>
       <p className="hint">
-        Year rule: <b>creation year − first observable commit year &lt; 4</b>. Same year and later first commit years pass.
+        The two year boxes define the <b>account-creation search range</b> and may span multiple years.
+        Internally, GitHub contribution requests are automatically split into safe one-year windows.
+        Year rule: <b>creation year − first observable commit year &lt; 4</b>.
       </p>
     </div>
   )

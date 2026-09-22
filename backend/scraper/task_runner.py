@@ -13,8 +13,7 @@ from core.rate_limiter import RateLimiter
 from db.history import HistoryDB
 from scraper.discovery import Discovery
 from scraper.filter_engine import account_created_year, passes_initial_filter, passes_year_rule
-from scraper.profile_extractor import ProfileExtractor
-from scraper.repo_extractor import RepoExtractor
+from scraper.contribution_extractor import ContributionExtractor
 
 
 @dataclass
@@ -58,16 +57,17 @@ class TaskRunner:
     def __init__(self, on_progress: Callable[[RunProgress], None] | None = None):
         self.history = HistoryDB(settings.db_csv_path, settings.exports_dir_path)
         self.dedup = DedupStore(settings.db_csv_path)
-        self.rate_limiter = RateLimiter(settings.graphql_point_floor, settings.token_list)
+        self.rate_limiter = RateLimiter(
+            settings.graphql_point_floor,
+            settings.token_list,
+            settings.max_concurrent_graphql,
+            settings.graphql_points_per_minute,
+        )
         self.discovery = Discovery(self.rate_limiter)
-        self.profile = ProfileExtractor(settings.max_concurrent_profiles, settings.profile_request_delay_ms)
-        self.repo = RepoExtractor(self.rate_limiter, settings.repo_scan_limit, settings.max_concurrent_repos)
+        self.contribution = ContributionExtractor(self.rate_limiter)
         self.on_progress = on_progress
         self.progress = RunProgress()
         self._started_mono = 0.0
-        # Guards the dedup-check + CSV-write step shared by all workers.
-        self._save_lock = asyncio.Lock()
-        self._stop = asyncio.Event()
 
     def _emit(self) -> None:
         self.progress.elapsed_seconds = round(monotonic() - self._started_mono, 2) if self._started_mono else 0
@@ -75,8 +75,8 @@ class TaskRunner:
             self.on_progress(self.progress)
 
     async def close(self) -> None:
-        await self.repo.aclose()
-        await self.profile.close()
+        await self.discovery.aclose()
+        await self.contribution.aclose()
 
     async def run(
         self,
@@ -107,78 +107,35 @@ class TaskRunner:
         self.progress.run_csv = str(run_path)
         self._emit()
 
-        workers_count = max(1, settings.max_concurrent_users)
-        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=workers_count * 2)
-        self._stop = asyncio.Event()
-
-        def limits_reached() -> bool:
-            return (
-                self.progress.extracted >= target_count
-                or self.progress.scanned_users >= max_scanned_users
-            )
-
-        async def producer() -> None:
-            """Feeds the bounded queue; back-pressure keeps memory flat."""
-            try:
-                async for user in self.discovery.stream_users(location, start_year, end_year):
-                    if self._stop.is_set() or limits_reached():
-                        break
-                    self.progress.scanned_users += 1
-                    login = user.get("login")
-                    self.progress.current_username = login
-                    self.progress.current_stage = "repository_filter"
-                    self._emit()
-                    if not login:
-                        self.progress.skipped += 1
-                        continue
-
-                    ok, reason = passes_initial_filter(user, min_repos, max_repos)
-                    if not ok:
-                        self.progress.skipped += 1
-                        if reason == "repo_count_out_of_range":
-                            self.progress.skipped_repo_range += 1
-                        self._emit()
-                        continue
-
-                    await queue.put(user)
-            finally:
-                self._stop.set()
-
-        async def worker() -> None:
-            while True:
-                if self._stop.is_set() and queue.empty():
-                    return
-                try:
-                    user = await asyncio.wait_for(queue.get(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    continue
-                try:
-                    if self.progress.extracted >= target_count:
-                        continue
-                    login = user.get("login")
-                    self.progress.current_username = login
-                    await self._process_user(login, user, run_path, strict_quality_gmail)
-                    if self.progress.extracted >= target_count:
-                        self._stop.set()
-                finally:
-                    queue.task_done()
-
-        tasks: list[asyncio.Task] = []
         try:
-            producer_task = asyncio.create_task(producer())
-            tasks = [asyncio.create_task(worker()) for _ in range(workers_count)]
-            await producer_task
-            await asyncio.gather(*tasks)
+            async for user in self.discovery.stream_users(location, start_year, end_year):
+                if (
+                    self.progress.extracted >= target_count
+                    or self.progress.scanned_users >= max_scanned_users
+                ):
+                    break
+                self.progress.scanned_users += 1
+                login = user.get("login")
+                self.progress.current_username = login
+                self.progress.current_stage = "repository_filter"
+                self._emit()
+                if not login:
+                    self.progress.skipped += 1
+                    continue
+
+                ok, reason = passes_initial_filter(user, min_repos, max_repos)
+                if not ok:
+                    self.progress.skipped += 1
+                    if reason == "repo_count_out_of_range":
+                        self.progress.skipped_repo_range += 1
+                    self._emit()
+                    continue
+
+                await self._process_user(login, user, run_path, strict_quality_gmail)
         except asyncio.CancelledError:
             self.progress.status = "cancelled"
-            for task in tasks:
-                task.cancel()
             raise
         except Exception as exc:
-            self._stop.set()
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
             self.progress.status = "failed"
             self.progress.errors += 1
             self.progress.last_error = str(exc)
@@ -202,44 +159,20 @@ class TaskRunner:
         strict_quality_gmail: bool,
     ) -> None:
 
-        # --------------------------------------------------------------
-        # Profile email
-        # --------------------------------------------------------------
-
-        self.progress.current_stage = "profile_email"
+        # Email comes directly from the GraphQL User node. No profile HTML
+        # request is made, which avoids IP-based HTML throttling.
+        self.progress.current_stage = "email_filter"
         self._emit()
 
         started = monotonic()
-
-        profile_email, profile_status = await self.profile.extract(login)
-
-        self.progress.profile_seconds += monotonic() - started
-
+        profile_email = user_node.get("email")
         if not profile_email:
             self.progress.skipped += 1
-
-            if profile_status == "no_profile_email":
-                self.progress.skipped_no_email += 1
-            else:
-                self.progress.errors += 1
-                self.progress.last_error = (
-                    f"{login}: {profile_status}"
-                )
-
+            self.progress.skipped_no_email += 1
             self._emit()
             return
 
         email = normalize_email(profile_email)
-
-        # --------------------------------------------------------------
-        # Gmail filter
-        # --------------------------------------------------------------
-
-        self.progress.current_stage = "gmail_filter"
-        self._emit()
-
-        started = monotonic()
-
         if not is_gmail(email):
             self.progress.skipped += 1
             self.progress.skipped_not_gmail += 1
@@ -255,6 +188,18 @@ class TaskRunner:
             return
 
         self.progress.gmail_filter_seconds += monotonic() - started
+
+        # Deduplicate BEFORE any contribution-history request.
+        self.progress.current_stage = "deduplication"
+        self._emit()
+        started = monotonic()
+        if self.dedup.contains(email):
+            self.progress.dedup_seconds += monotonic() - started
+            self.progress.skipped += 1
+            self.progress.skipped_duplicate += 1
+            self._emit()
+            return
+        self.progress.dedup_seconds += monotonic() - started
 
         # --------------------------------------------------------------
         # Account creation year
@@ -273,15 +218,20 @@ class TaskRunner:
         # First commit year
         # --------------------------------------------------------------
 
+        if created_year is None:
+            self.progress.skipped += 1
+            self.progress.skipped_year_mismatch += 1
+            self._emit()
+            return
+
         self.progress.current_stage = "first_commit_year"
         self._emit()
 
         started = monotonic()
 
         try:
-            first_year = await self.repo.first_commit_year(
+            first_year = await self.contribution.first_commit_year(
                 login,
-                user_id=user_node.get("id"),
                 account_created_year=created_year,
             )
         except Exception as exc:
@@ -319,45 +269,24 @@ class TaskRunner:
             return
 
         # --------------------------------------------------------------
-        # Deduplication
+        # Save result
         # --------------------------------------------------------------
 
-        self.progress.current_stage = "deduplication"
-        self._emit()
+        now = datetime.now(timezone.utc).isoformat()
 
-        started = monotonic()
+        record = {
+            "username": login,
+            "email": email,
+            "github_username": login,
+            "account_creation_year": created_year,
+            "first_commit_year": first_year,
+            "run_id": self.progress.run_id,
+            "scraped_at": now,
+        }
 
-        # One writer at a time: workers run concurrently, so the duplicate
-        # check and the write must be a single atomic step.
-        async with self._save_lock:
-            if self.dedup.contains(email):
-                self.progress.dedup_seconds += monotonic() - started
-                self.progress.skipped += 1
-                self.progress.skipped_duplicate += 1
-                self._emit()
-                return
-
-            self.progress.dedup_seconds += monotonic() - started
-
-            # ----------------------------------------------------------
-            # Save result
-            # ----------------------------------------------------------
-
-            now = datetime.now(timezone.utc).isoformat()
-
-            record = {
-                "username": login,
-                "email": email,
-                "github_username": login,
-                "account_creation_year": created_year,
-                "first_commit_year": first_year,
-                "run_id": self.progress.run_id,
-                "scraped_at": now,
-            }
-
-            self.history.append_to_db(record)
-            self.history.append_to_run(run_path, record)
-            self.dedup.add(email)
+        self.history.append_to_db(record)
+        self.history.append_to_run(run_path, record)
+        self.dedup.add(email)
 
         self.progress.extracted += 1
 
