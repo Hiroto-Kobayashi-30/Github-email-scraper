@@ -103,6 +103,21 @@ async def cancel_run():
     return {"cancelled": cancelled}
 
 
+@router.get("/tokens/status")
+async def token_status():
+    """Return live, per-token GitHub rate-limit telemetry."""
+    if manager.runner is not None:
+        return {"tokens": manager.runner.rate_limiter.token_status()}
+    from core.rate_limiter import RateLimiter
+    limiter = RateLimiter(
+        settings.graphql_point_floor,
+        settings.token_list,
+        settings.max_concurrent_graphql,
+        settings.graphql_points_per_minute,
+    )
+    return {"tokens": limiter.token_status()}
+
+
 @router.get("/history")
 async def history(limit: int = 100, offset: int = 0, q: str = ""):
     from db.history import HistoryDB

@@ -115,3 +115,27 @@ export function downloadUrl(path: string): string {
 export function runFileUrl(path: string): string {
   return `${API}/api/runs/file?path=${encodeURIComponent(path)}`
 }
+
+
+export type TokenStatus = {
+  token_index: number
+  label: string
+  masked: string
+  usage_percent: number | null
+  remaining: number | null
+  limit: number | null
+  reset_seconds: number
+  cooldown_seconds: number
+  cooldown_active: boolean
+  in_flight: number
+  last_cost: number
+  last_status: number | null
+  invalid: boolean
+  initialized: boolean
+}
+
+export async function fetchTokenStatus(): Promise<{ tokens: TokenStatus[] }> {
+  const r = await fetch(`${API}/api/tokens/status`, { cache: 'no-store' })
+  if (!r.ok) throw new Error('Failed to fetch token status')
+  return r.json()
+}

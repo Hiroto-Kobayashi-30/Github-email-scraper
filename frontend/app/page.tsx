@@ -8,6 +8,7 @@ import ControlPanel from './components/ControlPanel'
 import ProgressBar from './components/ProgressBar'
 import LiveResults from './components/LiveResults'
 import RunHistory from './components/RunHistory'
+import TokenStatus from './components/TokenStatus'
 
 const empty: Progress = {
   status: 'idle', target: 0, extracted: 0, skipped: 0, skipped_no_email: 0,
@@ -73,6 +74,10 @@ export default function Home() {
           onProgressUpdate={handleProgressUpdate}
         />
         <ProgressBar progress={progress} historical={historical} />
+      </section>
+
+      <section className="tokenSection">
+        <TokenStatus />
       </section>
 
       <section className="grid lowerGrid">

@@ -234,3 +234,25 @@ td:nth-child(2){color:#e3e8ec}
   .hero h1{font-size:28px}
   .tabToggle button{padding:7px 10px;font-size:11px}
 }
+
+/* Token telemetry */
+.tokenSection{margin-top:18px}
+.tokenCard{padding-bottom:18px}
+.tokenTitle{margin-bottom:15px}
+.tokenHint{display:flex;align-items:center;gap:6px;color:#71808c;font-size:11px}
+.tokenTableWrap{overflow:auto;max-height:230px;border:1px solid #20262d;border-radius:10px}
+.tokenTable{font-size:11px}
+.tokenTable th{position:sticky;top:0;background:#11151a;z-index:1}
+.tokenName{display:flex;align-items:center;gap:7px;white-space:nowrap}
+.tokenName svg{color:#7d8994}
+.tokenName code{color:#7e8a96;font-size:10px}
+.tokenUsage{min-width:150px;display:flex;align-items:center;gap:9px}
+.tokenUsage .miniTrack{width:105px;height:6px}
+.tokenUsage span{min-width:42px;color:#aeb7c0}
+.tokenRemaining{white-space:nowrap}
+.tokenCooldown{color:var(--warn)}
+.tokenFootnote{color:#68737f;font-size:10px;line-height:1.5;margin:12px 2px 0}
+.tokenEmpty{padding:25px 10px}
+@media(max-width:700px){
+  .tokenTable{min-width:720px}
+}

@@ -59,9 +59,10 @@ class Discovery:
                     },
                 )
                 self.rate_limiter.update_from_headers(response.headers, token)
+                self.rate_limiter.note_response(token, response.status_code, response.headers)
 
                 if response.status_code == 401:
-                    await self.rate_limiter.release()
+                    await self.rate_limiter.release(token)
                     switched = await self.rate_limiter.mark_invalid(token)
                     last_error = "GitHub token rejected with HTTP 401 Unauthorized"
                     if switched:
@@ -69,21 +70,23 @@ class Discovery:
                     raise RuntimeError(last_error)
 
                 if response.status_code in (403, 429):
-                    await self.rate_limiter.release()
+                    await self.rate_limiter.release(token)
                     delay = self.rate_limiter.retry_delay(response.headers, attempt)
                     last_error = f"GitHub throttled request with HTTP {response.status_code}"
                     await asyncio.sleep(delay)
                     continue
 
                 if response.status_code in (500, 502, 503, 504):
-                    await self.rate_limiter.release()
+                    await self.rate_limiter.release(token)
                     last_error = f"HTTP {response.status_code}"
                     await asyncio.sleep(min(2 ** attempt, 16))
                     continue
 
                 response.raise_for_status()
                 payload = response.json()
-                await self.rate_limiter.release()
+                self.rate_limiter.record_graphql_result(token, payload)
+                self.rate_limiter.clear_cooldown(token)
+                await self.rate_limiter.release(token)
                 errors = payload.get("errors") or []
                 if errors:
                     message = errors[0].get("message", "GraphQL error")
@@ -96,7 +99,7 @@ class Discovery:
                 return payload["data"]
 
             except httpx.TimeoutException as exc:
-                await self.rate_limiter.release()
+                await self.rate_limiter.release(token)
                 last_error = f"Timeout: {exc}"
                 await asyncio.sleep(min(2 ** attempt, 16))
 

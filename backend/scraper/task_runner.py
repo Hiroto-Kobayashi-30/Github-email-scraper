@@ -91,7 +91,7 @@ class TaskRunner:
     ) -> RunProgress:
         # Fail before creating a misleading empty run when credentials are absent/malformed.
         settings.validate_github_tokens()
-        self._started_mono = monotonic()
+        # Re-read the complete permanent db.csv at the beginning of every run.\n        # This guarantees that duplicates created by previous runs are never\n        # missed, even if db.csv changed after TaskRunner construction.\n        self.dedup.reload()\n        self._started_mono = monotonic()
         run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         self.progress = RunProgress(
             run_id=run_id,

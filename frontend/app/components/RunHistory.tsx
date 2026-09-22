@@ -20,7 +20,7 @@ export default function RunHistory({ refreshKey }: Props) {
   useEffect(() => {
     if (tab === 'history') {
       setLoading(true)
-      fetchHistory(100, 0, query)
+      fetchHistory(20, 0, query)
         .then(d => {
           setRecords(d.records)
           setTotal(d.total)

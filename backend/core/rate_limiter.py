@@ -1,4 +1,4 @@
-"""Conservative GitHub GraphQL rate and concurrency limiter."""
+"""Conservative GitHub GraphQL rate/concurrency limiter with live token telemetry."""
 import asyncio
 import time
 from dataclasses import dataclass
@@ -6,17 +6,24 @@ from dataclasses import dataclass
 
 @dataclass
 class RateState:
-    remaining: int = 5000
-    reset_at: float = 0.0
+    remaining: int = 0
     limit: int = 5000
+    reset_at: float = 0.0
     invalid: bool = False
+    initialized: bool = False
+    in_flight: int = 0
+    cooldown_until: float = 0.0
+    last_cost: int = 0
+    last_status: int | None = None
+    last_error: str | None = None
 
 
 class RateLimiter:
-    """Serialize token selection and reserve primary/secondary capacity.
+    """Limit concurrency and keep each configured token's primary/secondary state.
 
-    The limiter deliberately keeps GraphQL concurrency low and spaces requests
-    so multiple workers cannot all observe the same stale primary-limit value.
+    Primary usage is taken from GitHub's response headers/rateLimit object.
+    Cooldown is taken from Retry-After when GitHub supplies it, otherwise the
+    rate-limit reset time. Secondary point pacing is deliberately conservative.
     """
 
     def __init__(self, floor: int = 500, tokens: list[str] | None = None,
@@ -36,6 +43,12 @@ class RateLimiter:
     @property
     def token_count(self) -> int:
         return len(self.tokens)
+
+    def _idx(self, token: str) -> int:
+        try:
+            return self.tokens.index(token)
+        except ValueError:
+            return 0
 
     async def _reserve_secondary_budget(self, estimated_points: int = 10) -> None:
         while True:
@@ -59,27 +72,52 @@ class RateLimiter:
             while True:
                 async with self._lock:
                     now = time.time()
+                    chosen = None
                     for offset in range(len(self.tokens)):
                         idx = (self._index + offset) % len(self.tokens)
                         state = self.states[idx]
-                        if not state.invalid and (state.remaining > self.floor or state.reset_at <= now):
-                            self._index = idx
+                        # Account for requests already in flight against the
+                        # primary-limit floor so concurrent requests cannot all
+                        # observe the same stale remaining value.
+                        projected = state.remaining - (state.in_flight * 10) if state.initialized else 5000
+                        if (
+                            not state.invalid
+                            and now >= state.cooldown_until
+                            and (not state.initialized or projected > self.floor or state.reset_at <= now)
+                        ):
+                            chosen = idx
+                            state.in_flight += 1
+                            self._index = (idx + 1) % len(self.tokens)
                             break
-                    else:
-                        usable = [s.reset_at for s in self.states if not s.invalid]
-                        if not usable:
-                            raise RuntimeError("All configured GitHub tokens are invalid or unauthorized.")
-                        wait = max(1.0, min(usable) - now + 1.0)
-                        idx = None
-                if idx is not None:
+                    if chosen is None:
+                        usable = [
+                            s.cooldown_until for s in self.states
+                            if not s.invalid and s.cooldown_until > now
+                        ]
+                        resets = [
+                            s.reset_at for s in self.states
+                            if not s.invalid and s.reset_at > now and s.initialized
+                        ]
+                        waits = usable + resets
+                        if not waits:
+                            if all(s.invalid for s in self.states):
+                                raise RuntimeError("All configured GitHub tokens are invalid or unauthorized.")
+                            wait = 1.0
+                        else:
+                            wait = max(0.25, min(waits) - now)
+                if chosen is not None:
                     await self._reserve_secondary_budget(10)
-                    return self.tokens[idx]
-                await asyncio.sleep(min(wait, 60.0))
+                    return self.tokens[chosen]
+                await asyncio.sleep(min(wait, 5.0))
         except Exception:
             self._concurrency.release()
             raise
 
-    async def release(self) -> None:
+    async def release(self, token: str | None = None) -> None:
+        async with self._lock:
+            if token is not None and token in self.tokens:
+                idx = self.tokens.index(token)
+                self.states[idx].in_flight = max(0, self.states[idx].in_flight - 1)
         self._concurrency.release()
 
     async def wait_if_needed(self) -> str:
@@ -88,17 +126,55 @@ class RateLimiter:
     def update_from_headers(self, headers, token: str | None = None) -> None:
         if not self.tokens:
             return
-        try:
-            idx = self.tokens.index(token) if token is not None else self._index
-        except ValueError:
-            idx = self._index
+        idx = self._idx(token) if token is not None else self._index
         state = self.states[idx]
         if headers.get("x-ratelimit-remaining") is not None:
             state.remaining = int(headers["x-ratelimit-remaining"])
+            state.initialized = True
         if headers.get("x-ratelimit-reset") is not None:
             state.reset_at = float(headers["x-ratelimit-reset"])
         if headers.get("x-ratelimit-limit") is not None:
             state.limit = int(headers["x-ratelimit-limit"])
+        state.last_status = None
+
+    def record_graphql_result(self, token: str, payload: dict) -> None:
+        """Capture the authoritative GraphQL rateLimit telemetry when present."""
+        if token not in self.tokens:
+            return
+        idx = self.tokens.index(token)
+        rl = payload.get("data", {}).get("rateLimit") if isinstance(payload, dict) else None
+        if not isinstance(rl, dict):
+            return
+        state = self.states[idx]
+        if rl.get("remaining") is not None:
+            state.remaining = int(rl["remaining"])
+            state.initialized = True
+        if rl.get("limit") is not None:
+            state.limit = int(rl["limit"])
+        if rl.get("resetAt"):
+            try:
+                from datetime import datetime
+                state.reset_at = datetime.fromisoformat(str(rl["resetAt"]).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                pass
+        if rl.get("cost") is not None:
+            state.last_cost = int(rl["cost"])
+
+    def note_response(self, token: str, status: int, headers=None, message: str | None = None) -> None:
+        if token not in self.tokens:
+            return
+        idx = self.tokens.index(token)
+        state = self.states[idx]
+        state.last_status = status
+        state.last_error = message
+        headers = headers or {}
+        delay = self.retry_delay(headers, 0)
+        if status in (403, 429):
+            state.cooldown_until = max(state.cooldown_until, time.time() + delay)
+
+    def clear_cooldown(self, token: str) -> None:
+        if token in self.tokens:
+            self.states[self.tokens.index(token)].cooldown_until = 0.0
 
     def retry_delay(self, headers, attempt: int) -> float:
         retry_after = headers.get("retry-after")
@@ -122,9 +198,37 @@ class RateLimiter:
             except ValueError:
                 return False
             self.states[idx].invalid = True
+            self.states[idx].in_flight = max(0, self.states[idx].in_flight - 1)
             for offset in range(1, len(self.tokens) + 1):
                 candidate = (idx + offset) % len(self.tokens)
                 if not self.states[candidate].invalid:
                     self._index = candidate
                     return True
             return False
+
+    def token_status(self) -> list[dict]:
+        now = time.time()
+        result = []
+        for i, (token, state) in enumerate(zip(self.tokens, self.states), start=1):
+            cooldown = max(0.0, state.cooldown_until - now)
+            reset = max(0.0, state.reset_at - now)
+            usage = None
+            if state.initialized and state.limit:
+                usage = round(max(0.0, min(100.0, (1 - state.remaining / state.limit) * 100)), 1)
+            result.append({
+                "token_index": i,
+                "label": f"Token {i}",
+                "masked": f"{token[:4]}…{token[-4:]}" if len(token) >= 8 else "••••",
+                "usage_percent": usage,
+                "remaining": state.remaining if state.initialized else None,
+                "limit": state.limit if state.initialized else None,
+                "reset_seconds": round(reset),
+                "cooldown_seconds": round(cooldown),
+                "cooldown_active": cooldown > 0,
+                "in_flight": state.in_flight,
+                "last_cost": state.last_cost,
+                "last_status": state.last_status,
+                "invalid": state.invalid,
+                "initialized": state.initialized,
+            })
+        return result

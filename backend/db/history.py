@@ -70,8 +70,13 @@ class HistoryDB:
         with self.db_csv_path.open("r", newline="", encoding="utf-8") as f:
             return max(0, sum(1 for _ in csv.reader(f)) - 1)
 
-    def recent_records(self, limit: int = 100, offset: int = 0) -> list[dict]:
-        """Return the most recently appended history records (newest first)."""
+    def recent_records(self, limit: int = 25, offset: int = 0) -> list[dict]:
+        """Return recent records from the entire db.csv, newest first.
+
+        The file is read in full so older records are never ignored when
+        determining what is in the permanent history. ``offset`` is applied
+        only after reversing to newest-first order.
+        """
         if not self.db_csv_path.exists():
             return []
         with self._lock:
