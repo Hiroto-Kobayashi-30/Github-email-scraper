@@ -61,7 +61,7 @@ class TaskRunner:
         self.rate_limiter = RateLimiter(settings.graphql_point_floor, settings.token_list)
         self.discovery = Discovery(self.rate_limiter)
         self.profile = ProfileExtractor(settings.max_concurrent_profiles, settings.profile_request_delay_ms)
-        self.repo = RepoExtractor(self.rate_limiter, settings.repo_scan_limit)
+        self.repo = RepoExtractor(self.rate_limiter, settings.repo_scan_limit, settings.max_concurrent_repos)
         self.on_progress = on_progress
         self.progress = RunProgress()
         self._started_mono = 0.0
