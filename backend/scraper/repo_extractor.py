@@ -156,9 +156,10 @@ query(
 class RepoExtractor:
     """Find the earliest observable commit year for a GitHub user."""
 
-    def __init__(self, rate_limiter, repo_limit: int = 100):
+    def __init__(self, rate_limiter, repo_limit: int = 100, max_concurrent_repos: int = 5):
         self.rate_limiter = rate_limiter
         self.repo_limit = max(1, repo_limit)
+        self.repo_sem = asyncio.Semaphore(max(1, max_concurrent_repos))
 
         self.client = httpx.AsyncClient(
             timeout=60.0,
@@ -548,7 +549,13 @@ class RepoExtractor:
         user_id: str | None = None,
         account_created_year: int | None = None,
     ) -> int | None:
-        """Return the earliest observable commit year for a GitHub user."""
+        """Return the earliest observable commit year for a GitHub user.
+
+        Repositories are processed in parallel batches (controlled by
+        ``max_concurrent_repos``) instead of one at a time. Within each
+        batch, every repo's binary search runs concurrently, and the
+        earliest year across the batch is kept.
+        """
 
         user_id = (
             user_id
@@ -572,10 +579,17 @@ class RepoExtractor:
             else MIN_COMMIT_YEAR
         )
 
-        async for repo in self._iter_owned_repositories(login):
+        # Collect repos into batches so we can process each batch
+        # concurrently while preserving the overall oldest-first order
+        # (repos are already ordered by CREATED_AT ASC).
+        batch: list[dict] = []
+        batch_size = max(1, self.repo_sem._value)
+
+        async def _process_repo(repo: dict) -> int | None:
+            """Process a single repo's binary search under the concurrency semaphore."""
 
             if repo.get("isArchived"):
-                continue
+                return None
 
             default_branch = (
                 repo.get("defaultBranchRef")
@@ -585,36 +599,73 @@ class RepoExtractor:
             branch_name = default_branch.get("name")
 
             if not branch_name:
-                continue
+                return None
 
             name_with_owner = repo.get("nameWithOwner")
 
             if not name_with_owner:
-                continue
+                return None
 
-            repo_year = await self._oldest_commit_year_for_repo(
-                name_with_owner=name_with_owner,
-                branch_name=branch_name,
-                author_id=user_id,
-                search_start_year=search_start_year,
+            async with self.repo_sem:
+                return await self._oldest_commit_year_for_repo(
+                    name_with_owner=name_with_owner,
+                    branch_name=branch_name,
+                    author_id=user_id,
+                    search_start_year=search_start_year,
+                )
+
+        async for repo in self._iter_owned_repositories(login):
+            batch.append(repo)
+
+            if len(batch) >= batch_size:
+                results = await asyncio.gather(
+                    *[_process_repo(r) for r in batch],
+                    return_exceptions=True,
+                )
+
+                for repo_year in results:
+                    if isinstance(repo_year, Exception):
+                        continue
+
+                    if repo_year is None:
+                        continue
+
+                    if (
+                        earliest_year is None
+                        or repo_year < earliest_year
+                    ):
+                        earliest_year = repo_year
+
+                # We cannot possibly find an earlier year than the
+                # account creation year.
+                if (
+                    account_created_year is not None
+                    and earliest_year is not None
+                    and earliest_year <= account_created_year
+                ):
+                    return earliest_year
+
+                batch.clear()
+
+        # Process any remaining repos in the final partial batch.
+        if batch:
+            results = await asyncio.gather(
+                *[_process_repo(r) for r in batch],
+                return_exceptions=True,
             )
 
-            if repo_year is None:
-                continue
+            for repo_year in results:
+                if isinstance(repo_year, Exception):
+                    continue
 
-            if (
-                earliest_year is None
-                or repo_year < earliest_year
-            ):
-                earliest_year = repo_year
+                if repo_year is None:
+                    continue
 
-            # We cannot possibly find an earlier year than the
-            # account creation year.
-            if (
-                account_created_year is not None
-                and earliest_year <= account_created_year
-            ):
-                return earliest_year
+                if (
+                    earliest_year is None
+                    or repo_year < earliest_year
+                ):
+                    earliest_year = repo_year
 
         return earliest_year
 

@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     max_concurrent_profiles: int = 8
     profile_request_delay_ms: int = 250
     repo_scan_limit: int = 100000
+    max_concurrent_repos: int = 5
     data_dir: str = "../data"
     db_csv: str = "../data/db.csv"
     exports_dir: str = "../data/exports"
