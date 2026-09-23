@@ -38,7 +38,10 @@ query($q: String!, $cursor: String, $pageSize: Int!) {
 class Discovery:
     def __init__(self, rate_limiter):
         self.rate_limiter = rate_limiter
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=45.0, write=15.0, pool=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=5.0),
+        )
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -99,8 +102,18 @@ class Discovery:
                 return payload["data"]
 
             except httpx.TimeoutException as exc:
+                # A slow GitHub response is a transport failure, not a fatal
+                # scraper failure. Release the slot and retry with backoff.
                 await self.rate_limiter.release(token)
-                last_error = f"Timeout: {exc}"
+                last_error = f"GitHub request timed out: {exc}"
+                await asyncio.sleep(min(2 ** attempt, 16))
+            except httpx.RequestError as exc:
+                # Includes RemoteProtocolError / ReadError messages such as
+                # "Server disconnected without sending a response." GitHub
+                # or an intermediary can close an idle/keep-alive connection.
+                # Treat this as transient and retry on the next connection.
+                await self.rate_limiter.release(token)
+                last_error = f"GitHub transport error: {exc}"
                 await asyncio.sleep(min(2 ** attempt, 16))
 
         raise RuntimeError(f"GitHub discovery failed after 5 attempts. Last error: {last_error}")

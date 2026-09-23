@@ -41,7 +41,10 @@ def _safe_year_window(year: int) -> tuple[str, str]:
 class ContributionExtractor:
     def __init__(self, rate_limiter):
         self.rate_limiter = rate_limiter
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=45.0, write=15.0, pool=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10, keepalive_expiry=5.0),
+        )
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -100,7 +103,14 @@ class ContributionExtractor:
                 return payload["data"]
             except httpx.TimeoutException as exc:
                 await self.rate_limiter.release(token)
-                last_error = f"Timeout: {exc}"
+                last_error = f"GitHub request timed out: {exc}"
+                await asyncio.sleep(min(2 ** attempt, 16))
+            except httpx.RequestError as exc:
+                # RemoteProtocolError / ReadError can surface as
+                # "Server disconnected without sending a response." This is
+                # normally transient, so retry instead of failing the user.
+                await self.rate_limiter.release(token)
+                last_error = f"GitHub transport error: {exc}"
                 await asyncio.sleep(min(2 ** attempt, 16))
 
         raise RuntimeError(f"Contribution query failed after 5 attempts. Last error: {last_error}")
