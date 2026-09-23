@@ -120,31 +120,51 @@ class HistoryDB:
             })
         return exports
 
-    def _export_folder(self, location: str) -> Path:
-        now = datetime.now()
-        folder = self.exports_dir / now.strftime("%m") / now.strftime("%d") / _safe_slug(location)
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
+    def _export_folder(self) -> Path:
+        """Return the single permanent EXPORTS directory.
 
-    def run_export_path(self, location: str, batch_count: int) -> Path:
-        """Create a short-named export for one result batch.
-
-        Layout: MM/DD/LOCATION/COUNT.csv
-        COUNT is the cumulative number of results represented by this file
-        (20, 40, 60, ...; the final partial batch uses its actual count).
+        Batch files are intentionally kept flat so each completed batch is
+        easy to find and download.
         """
-        path = self._export_folder(location) / f"{int(batch_count)}.csv"
+        self.exports_dir.mkdir(parents=True, exist_ok=True)
+        return self.exports_dir
+
+    def batch_export_path(self, location: str, batch_count: int) -> Path:
+        """Return a unique batch filename in EXPORTS.
+
+        Format: MM_DD_LOCATION_COUNT.CSV
+        The COUNT is the number of records contained in this batch file.
+        """
+        now = datetime.now()
+        location_slug = _safe_slug(location)
+        base = f"{now.strftime('%m_%d')}_{location_slug}_{int(batch_count)}.CSV"
+        folder = self._export_folder()
+        path = folder / base
+        if not path.exists():
+            return path
+
+        # Never overwrite an earlier run with the same date/location/count.
+        # Keep the requested naming scheme and add a deterministic suffix only
+        # when a collision is unavoidable.
+        index = 2
+        while True:
+            candidate = folder / f"{now.strftime('%m_%d')}_{location_slug}_{int(batch_count)}_{index}.CSV"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    def create_batch_export(self, location: str, batch_count: int) -> Path:
+        path = self.batch_export_path(location, batch_count)
         with path.open("w", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, fieldnames=RUN_HEADER).writeheader()
         return path
 
+    # Backward-compatible names used by older callers/tests.
+    def run_export_path(self, location: str, batch_count: int) -> Path:
+        return self.create_batch_export(location, batch_count)
+
     def next_batch_export_path(self, location: str, batch_count: int, step: int = 20) -> Path:
-        """Create COUNT.csv without overwriting an existing same-day export."""
-        folder = self._export_folder(location)
-        count = int(batch_count)
-        while (folder / f"{count}.csv").exists():
-            count += step
-        return self.run_export_path(location, count)
+        return self.batch_export_path(location, batch_count)
 
     def append_to_run(self, run_path: Path, record: dict) -> None:
         with self._lock:
