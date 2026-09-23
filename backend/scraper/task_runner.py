@@ -103,9 +103,30 @@ class TaskRunner:
             max_scanned_users=max_scanned_users,
             started_at=datetime.now(timezone.utc).isoformat(),
         )
-        run_path = self.history.run_export_path(location, target_count, run_id)
-        self.progress.run_csv = str(run_path)
-        self._emit()
+        # Results are written in batches of 20.  db.csv remains the permanent
+        # source of truth and is updated for every accepted result.
+        batch_size = 20
+        batch_records: list[dict] = []
+        batch_count = 0
+        run_path: Path | None = None
+
+        def open_batch_path(cumulative_count: int) -> Path:
+            # Keep the requested short filename when possible. If another run
+            # already used that COUNT.csv today, move to the next free count
+            # rather than overwriting it.
+            return self.history.next_batch_export_path(location, cumulative_count, batch_size)
+
+        def flush_batch() -> None:
+            nonlocal batch_records, batch_count, run_path
+            if not batch_records:
+                return
+            batch_count += len(batch_records)
+            run_path = open_batch_path(batch_count)
+            for record in batch_records:
+                self.history.append_to_run(run_path, record)
+            batch_records = []
+            self.progress.run_csv = str(run_path)
+            self._emit()
 
         try:
             async for user in self.discovery.stream_users(location, start_year, end_year):
@@ -131,15 +152,23 @@ class TaskRunner:
                     self._emit()
                     continue
 
-                await self._process_user(login, user, run_path, strict_quality_gmail)
+                record = await self._process_user(login, user, strict_quality_gmail)
+                if record is not None:
+                    batch_records.append(record)
+                    if len(batch_records) >= batch_size:
+                        flush_batch()
         except asyncio.CancelledError:
+            # Preserve every completed result even when the run is cancelled.
+            flush_batch()
             self.progress.status = "cancelled"
             raise
         except Exception as exc:
+            flush_batch()
             self.progress.status = "failed"
             self.progress.errors += 1
             self.progress.last_error = str(exc)
         else:
+            flush_batch()
             if self.progress.extracted >= target_count:
                 self.progress.status = "completed"
             elif self.progress.scanned_users >= max_scanned_users:
@@ -155,9 +184,8 @@ class TaskRunner:
         self,
         login: str,
         user_node: dict,
-        run_path: Path,
         strict_quality_gmail: bool,
-    ) -> None:
+    ) -> dict | None:
 
         # Email comes directly from the GraphQL User node. No profile HTML
         # request is made, which avoids IP-based HTML throttling.
@@ -285,7 +313,6 @@ class TaskRunner:
         }
 
         self.history.append_to_db(record)
-        self.history.append_to_run(run_path, record)
         self.dedup.add(email)
 
         self.progress.extracted += 1
@@ -304,3 +331,4 @@ class TaskRunner:
         self.progress.recent = self.progress.recent[:25]
 
         self._emit()
+        return record
