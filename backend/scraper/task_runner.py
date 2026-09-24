@@ -1,4 +1,4 @@
-"""Orchestrates discovery -> profile email -> Gmail -> first commit -> history."""
+"""Orchestrates discovery -> profile email -> Gmail -> deduplication -> history."""
 import asyncio
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -14,13 +14,10 @@ from core.gmail_filter import (
     normalize_email,
 )
 from core.rate_limiter import RateLimiter
+from core.rejection_cache import RejectionCache
 from db.history import HistoryDB
 from scraper.discovery import Discovery
-from scraper.filter_engine import (
-    passes_initial_filter,
-    passes_year_rule,
-)
-from scraper.contribution_extractor import ContributionExtractor
+from scraper.filter_engine import passes_initial_filter
 
 
 @dataclass
@@ -30,13 +27,11 @@ class RunProgress:
     location: str = ""
     min_repos: int = 0
     max_repos: int = 0
-    max_scanned_users: int = 200
     target: int = 0
     extracted: int = 0
     skipped: int = 0
     skipped_no_email: int = 0
     skipped_not_gmail: int = 0
-    skipped_year_mismatch: int = 0
     skipped_duplicate: int = 0
     skipped_repo_range: int = 0
 
@@ -52,7 +47,6 @@ class RunProgress:
     elapsed_seconds: float = 0.0
     profile_seconds: float = 0.0
     gmail_filter_seconds: float = 0.0
-    first_commit_seconds: float = 0.0
     dedup_seconds: float = 0.0
     current_username: str | None = None
     current_stage: str = "idle"
@@ -89,6 +83,16 @@ class TaskRunner:
             settings.db_csv_path
         )
 
+        self.rejection_cache = RejectionCache(
+            settings.data_dir_path / "rejection_cache.json",
+            settings.rejection_cache_ttl_days,
+        )
+
+        self._candidate_semaphore = asyncio.Semaphore(
+            max(1, settings.max_candidate_concurrency)
+        )
+        self._save_lock = asyncio.Lock()
+
         self.rate_limiter = RateLimiter(
             settings.graphql_point_floor,
             settings.token_list,
@@ -97,10 +101,6 @@ class TaskRunner:
         )
 
         self.discovery = Discovery(
-            self.rate_limiter
-        )
-
-        self.contribution = ContributionExtractor(
             self.rate_limiter
         )
 
@@ -123,7 +123,6 @@ class TaskRunner:
 
     async def close(self) -> None:
         await self.discovery.aclose()
-        await self.contribution.aclose()
 
     async def run(
         self,
@@ -134,7 +133,6 @@ class TaskRunner:
         start_year: int,
         end_year: int,
         strict_quality_gmail: bool = True,
-        max_scanned_users: int = 200,
     ) -> RunProgress:
 
         # Fail before creating a misleading empty run when credentials
@@ -160,7 +158,6 @@ class TaskRunner:
             min_repos=min_repos,
             max_repos=max_repos,
             target=target_count,
-            max_scanned_users=max_scanned_users,
             started_at=datetime.now(
                 timezone.utc
             ).isoformat(),
@@ -205,28 +202,31 @@ class TaskRunner:
             self._emit()
 
         try:
+            pending: set[asyncio.Task] = set()
+
+            async def drain(done_tasks) -> None:
+                for task in done_tasks:
+                    record = await task
+                    if record is not None:
+                        batch_records.append(record)
+                        if len(batch_records) >= batch_size:
+                            flush_batch()
+
             async for user in self.discovery.stream_users(
                 location,
                 start_year,
                 end_year,
             ):
-                if (
-                    self.progress.extracted >= target_count
-                    or self.progress.scanned_users
-                    >= max_scanned_users
-                ):
+                if self.progress.extracted >= target_count:
                     break
 
                 self.progress.scanned_users += 1
 
                 login = user.get("login")
+                user_id = user.get("id")
 
                 self.progress.current_username = login
-                self.progress.current_stage = (
-                    "repository_filter"
-                )
-
-                self._emit()
+                self.progress.current_stage = "repository_filter"
 
                 if not login:
                     self.progress.skipped += 1
@@ -240,24 +240,47 @@ class TaskRunner:
 
                 if not ok:
                     self.progress.skipped += 1
-
                     if reason == "repo_count_out_of_range":
                         self.progress.skipped_repo_range += 1
-
-                    self._emit()
                     continue
 
-                record = await self._process_user(
-                    login,
-                    user,
-                    strict_quality_gmail,
+                # A missing GraphQL email is terminal for this scraper.
+                # GitHub documents User.email as the publicly visible profile
+                # email, so do not make another per-user API request to hunt
+                # for an address the user has not exposed there.
+                if not user.get("email"):
+                    if self.rejection_cache.contains(user_id, login):
+                        self.progress.skipped += 1
+                        self.progress.skipped_no_email += 1
+                        continue
+
+                    self.rejection_cache.remember_no_public_email(user_id, login)
+                    self.progress.skipped += 1
+                    self.progress.skipped_no_email += 1
+                    continue
+
+                task = asyncio.create_task(
+                    self._process_user(
+                        login,
+                        user,
+                        strict_quality_gmail,
+                        target_count,
+                    )
                 )
+                pending.add(task)
 
-                if record is not None:
-                    batch_records.append(record)
+                # Keep a small bounded queue. We never create an unbounded
+                # number of tasks while GitHub discovery is streaming users.
+                if len(pending) >= max(1, settings.max_candidate_concurrency):
+                    done, pending = await asyncio.wait(
+                        pending,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    await drain(done)
 
-                    if len(batch_records) >= batch_size:
-                        flush_batch()
+            if pending:
+                done, _ = await asyncio.wait(pending)
+                await drain(done)
 
         except asyncio.CancelledError:
             # Preserve every completed result even when cancelled.
@@ -280,14 +303,6 @@ class TaskRunner:
             if self.progress.extracted >= target_count:
                 self.progress.status = "completed"
 
-            elif (
-                self.progress.scanned_users
-                >= max_scanned_users
-            ):
-                self.progress.status = (
-                    "scan_limit_reached"
-                )
-
             else:
                 self.progress.status = "exhausted"
 
@@ -309,242 +324,76 @@ class TaskRunner:
         login: str,
         user_node: dict,
         strict_quality_gmail: bool,
+        target_count: int,
     ) -> dict | None:
+        async with self._candidate_semaphore:
+            self.progress.current_username = login
+            self.progress.current_stage = "email_filter"
 
-        self.progress.current_stage = "email_filter"
-        self._emit()
-
-        started = monotonic()
-
-        # First try the email returned by GraphQL.
-        profile_email = user_node.get("email")
-
-        # GraphQL can return null even when the user's public profile
-        # exposes an email. Use the public REST profile as a fallback.
-        if not profile_email:
-            self.progress.profile_email_fallbacks += 1
-            self._emit()
-
-            try:
-                profile_email = (
-                    await self.discovery.public_profile_email(
-                        login
-                    )
-                )
-
-            except Exception as exc:
-                self.progress.errors += 1
-                self.progress.last_error = (
-                    f"{login}: public profile email "
-                    f"lookup failed: {exc}"
-                )
-
-                profile_email = None
-
-            if profile_email:
-                self.progress.profile_email_found += 1
-
-            else:
-                self.progress.profile_email_missing += 1
+            profile_email = user_node.get("email")
+            if not profile_email:
                 self.progress.skipped += 1
                 self.progress.skipped_no_email += 1
-
-                self._emit()
                 return None
 
-        email = normalize_email(
-            profile_email
-        )
+            email = normalize_email(profile_email)
 
-        if not is_gmail(email):
-            self.progress.skipped += 1
-            self.progress.skipped_not_gmail += 1
+            if not is_gmail(email):
+                self.progress.skipped += 1
+                self.progress.skipped_not_gmail += 1
+                return None
 
-            self.progress.gmail_filter_seconds += (
-                monotonic() - started
-            )
+            if strict_quality_gmail and not is_quality_gmail(email):
+                self.progress.skipped += 1
+                self.progress.skipped_not_gmail += 1
+                return None
 
-            self._emit()
-            return None
+            self.progress.current_stage = "deduplication"
 
-        if (
-            strict_quality_gmail
-            and not is_quality_gmail(email)
-        ):
-            self.progress.skipped += 1
-            self.progress.skipped_not_gmail += 1
+            # Only the final save section is serialized. This prevents two
+            # concurrent workers from both accepting the same Gmail address
+            # or exceeding the requested target count.
+            async with self._save_lock:
+                if self.progress.extracted >= target_count:
+                    return None
 
-            self.progress.gmail_filter_seconds += (
-                monotonic() - started
-            )
+                if self.dedup.contains(email):
+                    self.progress.skipped += 1
+                    self.progress.skipped_duplicate += 1
+                    return None
 
-            self._emit()
-            return None
-
-        self.progress.gmail_filter_seconds += (
-            monotonic() - started
-        )
-
-        # Deduplicate BEFORE any contribution-history request.
-        self.progress.current_stage = (
-            "deduplication"
-        )
-
-        self._emit()
-
-        started = monotonic()
-
-        if self.dedup.contains(email):
-            self.progress.dedup_seconds += (
-                monotonic() - started
-            )
-
-            self.progress.skipped += 1
-            self.progress.skipped_duplicate += 1
-
-            self._emit()
-            return None
-
-        self.progress.dedup_seconds += (
-            monotonic() - started
-        )
-
-        # --------------------------------------------------------------
-        # Account creation year
-        # --------------------------------------------------------------
-
-        created_at = user_node.get(
-            "createdAt"
-        )
-
-        created_year = None
-
-        if created_at:
-            try:
-                created_year = int(
-                    created_at[:4]
-                )
-            except (
-                TypeError,
-                ValueError,
-            ):
+                created_at = user_node.get("createdAt")
                 created_year = None
+                if created_at:
+                    try:
+                        created_year = int(created_at[:4])
+                    except (TypeError, ValueError):
+                        created_year = None
 
-        if created_year is None:
-            self.progress.skipped += 1
-            self.progress.skipped_year_mismatch += 1
+                if created_year is None:
+                    self.progress.skipped += 1
+                    return None
 
-            self._emit()
-            return None
+                now = datetime.now(timezone.utc).isoformat()
+                record = {
+                    "username": login,
+                    "email": email,
+                    "github_username": login,
+                    "account_creation_year": created_year,
+                    "run_id": self.progress.run_id,
+                    "scraped_at": now,
+                }
 
-        # --------------------------------------------------------------
-        # First commit year
-        # --------------------------------------------------------------
+                self.history.append_to_db(record)
+                self.dedup.add(email)
+                self.progress.extracted += 1
 
-        self.progress.current_stage = (
-            "first_commit_year"
-        )
+                self.progress.recent.insert(0, {
+                    "login": login,
+                    "email": email,
+                    "account_creation_year": created_year,
+                })
+                self.progress.recent = self.progress.recent[:25]
 
-        self._emit()
-
-        started = monotonic()
-
-        try:
-            first_year = (
-                await self.contribution.first_commit_year(
-                    login,
-                    account_created_year=created_year,
-                )
-            )
-
-        except Exception as exc:
-            self.progress.first_commit_seconds += (
-                monotonic() - started
-            )
-
-            self.progress.errors += 1
-
-            self.progress.last_error = (
-                f"{login}: {exc}"
-            )
-
-            self._emit()
-            return None
-
-        self.progress.first_commit_seconds += (
-            monotonic() - started
-        )
-
-        if (
-            first_year is None
-            or created_year is None
-        ):
-            self.progress.skipped += 1
-            self.progress.skipped_year_mismatch += 1
-
-            self._emit()
-            return None
-
-        # --------------------------------------------------------------
-        # Year rule
-        # --------------------------------------------------------------
-
-        passes, difference = passes_year_rule(
-            created_year,
-            first_year,
-        )
-
-        if not passes:
-            self.progress.skipped += 1
-            self.progress.skipped_year_mismatch += 1
-
-            self._emit()
-            return None
-
-        # --------------------------------------------------------------
-        # Save result
-        # --------------------------------------------------------------
-
-        now = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        record = {
-            "username": login,
-            "email": email,
-            "github_username": login,
-            "account_creation_year": created_year,
-            "first_commit_year": first_year,
-            "run_id": self.progress.run_id,
-            "scraped_at": now,
-        }
-
-        # Permanent master database.
-        self.history.append_to_db(
-            record
-        )
-
-        self.dedup.add(
-            email
-        )
-
-        self.progress.extracted += 1
-
-        self.progress.recent.insert(
-            0,
-            {
-                "login": login,
-                "email": email,
-                "account_creation_year": created_year,
-                "first_commit_year": first_year,
-                "difference": difference,
-            },
-        )
-
-        self.progress.recent = (
-            self.progress.recent[:25]
-        )
-
-        self._emit()
-
-        return record
+                self._emit()
+                return record

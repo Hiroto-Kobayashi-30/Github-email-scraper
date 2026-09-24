@@ -20,7 +20,6 @@ class StartRunRequest(BaseModel):
     start_year: int = Field(default=2008, ge=2008, le=2100)
     end_year: int = Field(default=2026, ge=2008, le=2100)
     strict_quality_gmail: bool = True
-    max_scanned_users: int = Field(default=200, ge=1, le=100000)
 
     @field_validator("location")
     @classmethod

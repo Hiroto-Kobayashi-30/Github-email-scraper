@@ -18,7 +18,6 @@ const defaults: RunForm = {
   start_year: 2008,
   end_year: new Date().getFullYear(),
   strict_quality_gmail: true,
-  max_scanned_users: 200,
 }
 
 export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Props) {
@@ -87,10 +86,6 @@ export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Prop
           Account creation year to
           <input type="number" min={2008} value={form.end_year} onChange={e => set('end_year', +e.target.value)} />
         </label>
-        <label className="wide">
-          Max users to scan
-          <input type="number" min={1} value={form.max_scanned_users} onChange={e => set('max_scanned_users', +e.target.value)} />
-        </label>
       </div>
       <label className="check">
         <input
@@ -114,9 +109,9 @@ export default function ControlPanel({ busy, onStarted, onProgressUpdate }: Prop
         )}
       </div>
       <p className="hint">
-        The two year boxes define the <b>account-creation search range</b> and may span multiple years.
-        Internally, GitHub contribution requests are automatically split into safe one-year windows.
-        Year rule: <b>creation year − first observable commit year &lt; 4</b>.
+        The two year boxes define the <b>account-creation search range</b>.
+        Users are scanned continuously until the Target Gmail accounts count is reached
+        or the matching GitHub search space is exhausted.
       </p>
     </div>
   )

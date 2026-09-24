@@ -7,7 +7,7 @@ from pathlib import Path
 
 DB_HEADER = [
     "username", "email", "github_username",
-    "account_creation_year", "first_commit_year", "run_id", "scraped_at",
+    "account_creation_year", "run_id", "scraped_at",
 ]
 RUN_HEADER = DB_HEADER
 
@@ -52,7 +52,6 @@ class HistoryDB:
                     "email": row.get("email", ""),
                     "github_username": row.get("github_username", row.get("username", "")),
                     "account_creation_year": row.get("account_creation_year", ""),
-                    "first_commit_year": row.get("first_commit_year", ""),
                     "run_id": row.get("run_id", "legacy"),
                     "scraped_at": row.get("scraped_at", ""),
                 })

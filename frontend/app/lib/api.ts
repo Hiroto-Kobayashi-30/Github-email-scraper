@@ -11,7 +11,6 @@ export type Progress = {
 
   skipped_no_email: number
   skipped_not_gmail: number
-  skipped_year_mismatch: number
   skipped_duplicate: number
   skipped_repo_range: number
 
@@ -30,7 +29,6 @@ export type Progress = {
   elapsed_seconds: number
   profile_seconds?: number
   gmail_filter_seconds?: number
-  first_commit_seconds?: number
   dedup_seconds?: number
 
   run_csv?: string | null
@@ -40,8 +38,6 @@ export type Progress = {
     login: string
     email: string
     account_creation_year: number
-    first_commit_year: number
-    difference: number
   }>
 }
 
@@ -50,7 +46,6 @@ export type HistoryRecord = {
   email: string
   github_username: string
   account_creation_year: string | number
-  first_commit_year: string | number
   run_id: string
   scraped_at: string
 }
@@ -70,7 +65,6 @@ export type RunForm = {
   start_year: number
   end_year: number
   strict_quality_gmail: boolean
-  max_scanned_users: number
 }
 
 const API =

@@ -19,7 +19,6 @@ export default function ProgressBar({ progress, historical }: Props) {
     repository_filter: 'Filtering repositories',
     profile_email: 'Extracting profile email',
     gmail_filter: 'Checking Gmail filter',
-    first_commit_year: 'Finding first commit year',
     deduplication: 'Deduplicating',
     finished: 'Finished',
   }

@@ -10,8 +10,6 @@ from typing import AsyncIterator
 import httpx
 
 GRAPHQL_URL = "https://api.github.com/graphql"
-REST_USER_URL = "https://api.github.com/users/{login}"
-
 USER_SEARCH_QUERY = """
 query($q: String!, $cursor: String, $pageSize: Int!) {
   search(query: $q, type: USER, first: $pageSize, after: $cursor) {
@@ -54,23 +52,8 @@ class Discovery:
             ),
         )
 
-        self.rest_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=10.0,
-                read=30.0,
-                write=15.0,
-                pool=10.0,
-            ),
-            limits=httpx.Limits(
-                max_connections=10,
-                max_keepalive_connections=5,
-                keepalive_expiry=5.0,
-            ),
-        )
-
     async def aclose(self) -> None:
         await self.client.aclose()
-        await self.rest_client.aclose()
 
     async def _post(self, query: str, variables: dict) -> dict:
         last_error = None
@@ -219,141 +202,6 @@ class Discovery:
             "GitHub discovery failed after 5 attempts. "
             f"Last error: {last_error}"
         )
-
-    async def public_profile_email(
-        self,
-        login: str,
-    ) -> str | None:
-        """Return the email GitHub exposes on the user's public profile.
-
-        This is a fallback for cases where GraphQL user search returns
-        a null ``email`` field.
-
-        This does NOT call the private /user/emails endpoint.
-        """
-
-        last_error = None
-
-        for attempt in range(4):
-            # REST profile requests do not consume the GraphQL secondary
-            # point budget, so reserve zero estimated GraphQL points.
-            token = await self.rate_limiter.wait_if_needed(
-                estimated_points=0
-            )
-
-            try:
-                response = await self.rest_client.get(
-                    REST_USER_URL.format(login=login),
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/vnd.github+json",
-                        "X-GitHub-Api-Version": "2026-03-10",
-                    },
-                )
-
-                self.rate_limiter.update_from_headers(
-                    response.headers,
-                    token,
-                )
-
-                self.rate_limiter.note_response(
-                    token,
-                    response.status_code,
-                    response.headers,
-                )
-
-                if response.status_code == 401:
-                    await self.rate_limiter.release(token)
-
-                    switched = await self.rate_limiter.mark_invalid(
-                        token
-                    )
-
-                    last_error = (
-                        "GitHub token rejected with HTTP 401 Unauthorized"
-                    )
-
-                    if switched:
-                        continue
-
-                    raise RuntimeError(last_error)
-
-                if response.status_code in (403, 429):
-                    await self.rate_limiter.release(token)
-
-                    await asyncio.sleep(
-                        self.rate_limiter.retry_delay(
-                            response.headers,
-                            attempt,
-                        )
-                    )
-
-                    continue
-
-                if response.status_code in (
-                    500,
-                    502,
-                    503,
-                    504,
-                ):
-                    await self.rate_limiter.release(token)
-
-                    last_error = (
-                        f"HTTP {response.status_code}"
-                    )
-
-                    await asyncio.sleep(
-                        min(2 ** attempt, 8)
-                    )
-
-                    continue
-
-                if response.status_code == 404:
-                    await self.rate_limiter.release(token)
-                    return None
-
-                response.raise_for_status()
-
-                payload = response.json()
-
-                self.rate_limiter.clear_cooldown(token)
-
-                await self.rate_limiter.release(token)
-
-                email = (
-                    payload.get("email")
-                    if isinstance(payload, dict)
-                    else None
-                )
-
-                if isinstance(email, str) and email.strip():
-                    return email.strip()
-
-                return None
-
-            except httpx.TimeoutException as exc:
-                await self.rate_limiter.release(token)
-
-                last_error = (
-                    f"GitHub profile request timed out: {exc}"
-                )
-
-                await asyncio.sleep(
-                    min(2 ** attempt, 8)
-                )
-
-            except httpx.RequestError as exc:
-                await self.rate_limiter.release(token)
-
-                last_error = (
-                    f"GitHub profile transport error: {exc}"
-                )
-
-                await asyncio.sleep(
-                    min(2 ** attempt, 8)
-                )
-
-        return None
 
     async def stream_users(
         self,

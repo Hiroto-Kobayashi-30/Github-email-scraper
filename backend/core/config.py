@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     max_concurrent_graphql: int = 4
+    max_candidate_concurrency: int = 4
+    rejection_cache_ttl_days: int = 30
     graphql_points_per_minute: int = 1600
     data_dir: str = "../data"
     db_csv: str = "../data/db.csv"

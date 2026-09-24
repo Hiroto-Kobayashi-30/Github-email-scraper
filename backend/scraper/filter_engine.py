@@ -26,8 +26,3 @@ def passes_initial_filter(user: dict, min_repos: int, max_repos: int) -> tuple[b
         return False, "no_created_at"
     return True, "ok"
 
-
-def passes_year_rule(created_year: int, first_commit_year: int) -> tuple[bool, int]:
-    """User-defined rule: accept when creation year - first commit year < 4."""
-    difference = created_year - first_commit_year
-    return difference < 4, difference

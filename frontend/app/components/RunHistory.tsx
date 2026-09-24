@@ -82,21 +82,17 @@ export default function RunHistory({ refreshKey }: Props) {
                   <th>Username</th>
                   <th>Email</th>
                   <th>Created</th>
-                  <th>First Commit</th>
-                  <th>Gap</th>
                   <th>Date</th>
                 </tr>
               </thead>
               <tbody>
                 {loading ? (
                   <tr>
-                    <td colSpan={6} className="empty">Loading…</td>
+                    <td colSpan={5} className="empty">Loading…</td>
                   </tr>
                 ) : records.length ? (
                   records.map((r, i) => {
                     const created = Number(r.account_creation_year) || 0
-                    const first = Number(r.first_commit_year) || 0
-                    const gap = created - first
                     return (
                       <tr key={`${r.username}-${i}`}>
                         <td>
@@ -111,10 +107,6 @@ export default function RunHistory({ refreshKey }: Props) {
                         </td>
                         <td>{r.email}</td>
                         <td>{created || '—'}</td>
-                        <td>{first || '—'}</td>
-                        <td className={gap < 0 ? 'gapNeg' : 'gapPos'}>
-                          {gap > 0 ? `+${gap}` : gap}
-                        </td>
                         <td className="mutedCell">
                           {r.scraped_at ? new Date(r.scraped_at).toLocaleDateString() : '—'}
                         </td>
@@ -123,7 +115,7 @@ export default function RunHistory({ refreshKey }: Props) {
                   })
                 ) : (
                   <tr>
-                    <td colSpan={6} className="empty">No records yet.</td>
+                    <td colSpan={5} className="empty">No records yet.</td>
                   </tr>
                 )}
               </tbody>

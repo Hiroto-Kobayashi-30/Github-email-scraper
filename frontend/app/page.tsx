@@ -12,7 +12,7 @@ import TokenStatus from './components/TokenStatus'
 
 const empty: Progress = {
   status: 'idle', target: 0, extracted: 0, skipped: 0, skipped_no_email: 0,
-  skipped_not_gmail: 0, skipped_year_mismatch: 0, skipped_duplicate: 0,
+  skipped_not_gmail: 0, skipped_duplicate: 0,
   skipped_repo_range: 0, errors: 0, scanned_users: 0, progress_percent: 0,
   elapsed_seconds: 0, recent: []
 }

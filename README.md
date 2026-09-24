@@ -16,12 +16,26 @@ For the first-commit rule, GitHub's contribution API is queried in individual ca
 ## Pipeline
 
 1. Search GitHub users by location and account-creation year, one creation year at a time.
-2. Read the user's public profile email directly from GraphQL; no HTML profile scraping.
-3. Keep only Gmail addresses (with optional quality filtering).
-4. Deduplicate the Gmail address **before** contribution-history queries.
-5. Check commit contributions for the four calendar years beginning with the account creation year.
-6. Accept when `account_creation_year - first_commit_year < 4`.
-7. Append accepted records to `data/db.csv` and the current run CSV.
+2. Read the user's **public profile email** directly from GraphQL. GitHub documents `User.email` as the user's publicly visible profile email.
+3. If GraphQL returns no public email, reject the candidate immediately. The scraper does **not** make a second per-user REST request to hunt for another address.
+4. Remember that negative decision in `data/rejection_cache.json` for a configurable TTL (30 days by default), so the same candidate is not repeatedly re-processed.
+5. Keep only Gmail addresses (with optional quality filtering).
+6. Deduplicate the Gmail address before saving it to permanent history.
+7. Candidate processing uses bounded concurrency; it never creates an unbounded task queue.
+8. Accepted records are appended to `data/db.csv` and the current run CSV.
+
+### Why the negative cache exists
+
+The cache is deliberately **negative-only**. It stores the GitHub user ID/login, the rejection reason, and the time checked; it does not store discovered email addresses. Entries expire so a user who later makes an email public can be considered again.
+
+### Concurrency
+
+Two separate controls are used:
+
+- `MAX_CONCURRENT_GRAPHQL` limits simultaneous GitHub GraphQL requests.
+- `MAX_CANDIDATE_CONCURRENCY` limits in-process candidate workers.
+
+Keep these conservative. More concurrency is not automatically better because GitHub also applies secondary rate limits.
 
 ## Run locally
 

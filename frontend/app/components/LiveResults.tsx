@@ -11,7 +11,6 @@ export default function LiveResults({ progress }: Props) {
   const breakdown = [
     { label: 'No profile email', value: progress.skipped_no_email },
     { label: 'Not Gmail / quality gate', value: progress.skipped_not_gmail },
-    { label: 'Year rule', value: progress.skipped_year_mismatch },
     { label: 'Already collected', value: progress.skipped_duplicate },
     { label: 'Repository range', value: progress.skipped_repo_range },
   ]
@@ -32,8 +31,7 @@ export default function LiveResults({ progress }: Props) {
             <tr>
               <th>GitHub</th>
               <th>Email</th>
-              <th>Created → First Commit</th>
-              <th>Gap</th>
+              <th>Created</th>
             </tr>
           </thead>
           <tbody>
@@ -51,17 +49,12 @@ export default function LiveResults({ progress }: Props) {
                     </a>
                   </td>
                   <td>{r.email}</td>
-                  <td>
-                    {r.account_creation_year} → {r.first_commit_year}
-                  </td>
-                  <td className={r.difference < 0 ? 'gapNeg' : 'gapPos'}>
-                    {r.difference > 0 ? `+${r.difference}` : r.difference}
-                  </td>
+                  <td>{r.account_creation_year}</td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td colSpan={4} className="empty">
+                <td colSpan={3} className="empty">
                   Accepted users will appear here.
                 </td>
               </tr>
