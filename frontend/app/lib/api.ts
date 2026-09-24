@@ -14,7 +14,6 @@ export type Progress = {
   skipped_duplicate: number
   skipped_repo_range: number
 
-  // Public-profile email fallback telemetry.
   profile_email_fallbacks?: number
   profile_email_found?: number
   profile_email_missing?: number
@@ -76,17 +75,9 @@ export const apiBase = API
 export async function fetchProgress(): Promise<Progress> {
   const r = await fetch(
     `${API}/api/runs/current`,
-    {
-      cache: 'no-store',
-    }
+    { cache: 'no-store' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'plz run the backend locally : Failed to fetch current run'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to fetch current run')
   return r.json()
 }
 
@@ -96,17 +87,9 @@ export async function fetchStats(): Promise<{
 }> {
   const r = await fetch(
     `${API}/api/stats`,
-    {
-      cache: 'no-store',
-    }
+    { cache: 'no-store' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'plz run the backend locally : Failed to fetch stats'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to fetch stats')
   return r.json()
 }
 
@@ -117,22 +100,12 @@ export async function startRun(
     `${API}/api/runs`,
     {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form),
     }
   )
-
   const body = await r.json()
-
-  if (!r.ok) {
-    throw new Error(
-      body.detail
-      || 'Could not start run'
-    )
-  }
-
+  if (!r.ok) throw new Error(body.detail || 'Could not start run')
   return body
 }
 
@@ -141,17 +114,9 @@ export async function cancelRun(): Promise<{
 }> {
   const r = await fetch(
     `${API}/api/runs/cancel`,
-    {
-      method: 'POST',
-    }
+    { method: 'POST' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'Failed to cancel run'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to cancel run')
   return r.json()
 }
 
@@ -163,32 +128,17 @@ export async function fetchHistory(
   total: number
   records: HistoryRecord[]
 }> {
-  const params =
-    new URLSearchParams({
-      limit: String(limit),
-      offset: String(offset),
-    })
-
-  if (q) {
-    params.set(
-      'q',
-      q
-    )
-  }
+  const params = new URLSearchParams({
+    limit: String(limit),
+    offset: String(offset),
+  })
+  if (q) params.set('q', q)
 
   const r = await fetch(
     `${API}/api/history?${params}`,
-    {
-      cache: 'no-store',
-    }
+    { cache: 'no-store' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'plz run the backend locally : Failed to fetch history'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to fetch history')
   return r.json()
 }
 
@@ -197,36 +147,18 @@ export async function fetchExports(): Promise<{
 }> {
   const r = await fetch(
     `${API}/api/exports`,
-    {
-      cache: 'no-store',
-    }
+    { cache: 'no-store' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'plz run the backend locally : Failed to fetch exports'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to fetch exports')
   return r.json()
 }
 
-export function downloadUrl(
-  path: string
-): string {
-  return (
-    `${API}/api/exports/download?path=` +
-    encodeURIComponent(path)
-  )
+export function downloadUrl(path: string): string {
+  return `${API}/api/exports/download?path=` + encodeURIComponent(path)
 }
 
-export function runFileUrl(
-  path: string
-): string {
-  return (
-    `${API}/api/runs/file?path=` +
-    encodeURIComponent(path)
-  )
+export function runFileUrl(path: string): string {
+  return `${API}/api/runs/file?path=` + encodeURIComponent(path)
 }
 
 export type TokenStatus = {
@@ -256,16 +188,8 @@ export async function fetchTokenStatus(): Promise<{
 }> {
   const r = await fetch(
     `${API}/api/tokens/status`,
-    {
-      cache: 'no-store',
-    }
+    { cache: 'no-store' }
   )
-
-  if (!r.ok) {
-    throw new Error(
-      'plz run the backend locally : Failed to fetch token status'
-    )
-  }
-
+  if (!r.ok) throw new Error('Failed to fetch token status')
   return r.json()
 }

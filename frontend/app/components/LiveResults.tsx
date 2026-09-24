@@ -8,14 +8,6 @@ type Props = {
 }
 
 export default function LiveResults({ progress }: Props) {
-  const breakdown = [
-    { label: 'No profile email', value: progress.skipped_no_email },
-    { label: 'Not Gmail / quality gate', value: progress.skipped_not_gmail },
-    { label: 'Already collected', value: progress.skipped_duplicate },
-    { label: 'Repository range', value: progress.skipped_repo_range },
-  ]
-  const total = Math.max(progress.skipped, 1)
-
   return (
     <div className="card">
       <div className="cardTitle">

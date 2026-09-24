@@ -266,6 +266,8 @@ class TaskRunner:
                 self.progress.status = "exhausted"
 
         finally:
+            await self.close()
+
             self.progress.finished_at = (
                 datetime.now(
                     timezone.utc
