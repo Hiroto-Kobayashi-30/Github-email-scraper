@@ -24,7 +24,11 @@ export default function ProgressBar({ progress, historical }: Props) {
   }
 
   const stageLabel = stageLabels[progress.current_stage || 'idle'] || progress.current_stage || 'Idle'
-  const runFile = progress.run_csv ? runFileUrl(progress.run_csv) : '#'
+  const exports = progress.run_exports?.length
+    ? progress.run_exports
+    : progress.run_csv
+      ? [progress.run_csv]
+      : []
 
   return (
     <div className="card runCard">
@@ -59,10 +63,14 @@ export default function ProgressBar({ progress, historical }: Props) {
       {progress.last_error && progress.status !== 'running' && (
         <div className="error" style={{ marginTop: '10px' }}>{progress.last_error}</div>
       )}
-      {progress.run_csv && progress.status !== 'running' && (
-        <a className="download" href={runFile}>
-          <Download size={16} /> Download this run CSV
-        </a>
+      {exports.length > 0 && progress.status !== 'running' && (
+        <div className="downloadList">
+          {exports.map((p, i) => (
+            <a key={p} className="download" href={runFileUrl(p)}>
+              <Download size={16} /> Download part {i + 1} of {exports.length}
+            </a>
+          ))}
+        </div>
       )}
     </div>
   )

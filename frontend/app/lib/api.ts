@@ -31,6 +31,7 @@ export type Progress = {
   dedup_seconds?: number
 
   run_csv?: string | null
+  run_exports?: string[]
   last_error?: string | null
 
   recent: Array<{

@@ -2,7 +2,6 @@
 import asyncio
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from pathlib import Path
 from time import monotonic
 from typing import Callable
 
@@ -14,7 +13,7 @@ from core.gmail_filter import (
     normalize_email,
 )
 from core.rate_limiter import RateLimiter
-from db.history import HistoryDB
+from db.history import HistoryDB, EXPORT_BATCH_SIZE
 from scraper.discovery import Discovery
 from scraper.filter_engine import passes_initial_filter
 
@@ -34,7 +33,6 @@ class RunProgress:
     skipped_duplicate: int = 0
     skipped_repo_range: int = 0
 
-    # Public-profile email fallback telemetry.
     profile_email_fallbacks: int = 0
     profile_email_found: int = 0
     profile_email_missing: int = 0
@@ -50,6 +48,7 @@ class RunProgress:
     current_username: str | None = None
     current_stage: str = "idle"
     run_csv: str | None = None
+    run_exports: list[str] = field(default_factory=list)
     last_error: str | None = None
     recent: list[dict] = field(default_factory=list)
 
@@ -113,6 +112,23 @@ class TaskRunner:
     async def close(self) -> None:
         await self.discovery.aclose()
 
+    def _finalize_exports(self, location: str, all_records: list[dict]) -> None:
+        """Split completed results into 20-entry CSV files after scraping finishes."""
+        if not all_records:
+            return
+
+        paths = self.history.create_run_exports(
+            location,
+            all_records,
+            batch_size=EXPORT_BATCH_SIZE,
+        )
+
+        self.progress.run_exports = [str(p) for p in paths]
+        if paths:
+            self.progress.run_csv = str(paths[0])
+
+        self._emit()
+
     async def run(
         self,
         target_count: int,
@@ -124,12 +140,8 @@ class TaskRunner:
         strict_quality_gmail: bool = True,
     ) -> RunProgress:
 
-        # Fail before creating a misleading empty run when credentials
-        # are absent or malformed.
         settings.validate_github_tokens()
 
-        # Reload the complete permanent db.csv at the beginning of every run.
-        # This guarantees duplicates from previous runs are never missed.
         self.dedup.reload()
 
         self._started_mono = monotonic()
@@ -152,43 +164,7 @@ class TaskRunner:
             ).isoformat(),
         )
 
-        # Results are written in batches of 20.
-        # db.csv remains the permanent source of truth and is updated
-        # immediately for every accepted result.
-        batch_size = 20
-        batch_records: list[dict] = []
-        batch_number = 0
-        run_path: Path | None = None
-
-        def flush_batch() -> None:
-            nonlocal batch_records
-            nonlocal batch_number
-            nonlocal run_path
-
-            if not batch_records:
-                return
-
-            batch_number += 1
-
-            # COUNT is the number of records in THIS batch.
-            run_path = self.history.create_batch_export(
-                location,
-                len(batch_records),
-            )
-
-            for record in batch_records:
-                self.history.append_to_run(
-                    run_path,
-                    record,
-                )
-
-            batch_records = []
-
-            self.progress.run_csv = str(
-                run_path
-            )
-
-            self._emit()
+        all_records: list[dict] = []
 
         try:
             async for user in self.discovery.stream_users(
@@ -232,36 +208,29 @@ class TaskRunner:
                 record = await self._process_user(
                     login,
                     user,
+                    location,
                     strict_quality_gmail,
                 )
 
                 if record is not None:
-                    batch_records.append(record)
-
-                    if len(batch_records) >= batch_size:
-                        flush_batch()
+                    all_records.append(record)
 
         except asyncio.CancelledError:
-            # Preserve every completed result even when cancelled.
-            flush_batch()
-
+            self._finalize_exports(location, all_records)
             self.progress.status = "cancelled"
-
             raise
 
         except Exception as exc:
-            flush_batch()
-
+            self._finalize_exports(location, all_records)
             self.progress.status = "failed"
             self.progress.errors += 1
             self.progress.last_error = str(exc)
 
         else:
-            flush_batch()
+            self._finalize_exports(location, all_records)
 
             if self.progress.extracted >= target_count:
                 self.progress.status = "completed"
-
             else:
                 self.progress.status = "exhausted"
 
@@ -284,6 +253,7 @@ class TaskRunner:
         self,
         login: str,
         user_node: dict,
+        location: str,
         strict_quality_gmail: bool,
     ) -> dict | None:
 
@@ -292,11 +262,8 @@ class TaskRunner:
 
         started = monotonic()
 
-        # First try the email returned by GraphQL.
         profile_email = user_node.get("email")
 
-        # GraphQL can return null even when the user's public profile
-        # exposes an email. Use the public REST profile as a fallback.
         if not profile_email:
             self.progress.profile_email_fallbacks += 1
             self._emit()
@@ -361,7 +328,6 @@ class TaskRunner:
             monotonic() - started
         )
 
-        # Deduplicate before saving the accepted result.
         self.progress.current_stage = (
             "deduplication"
         )
@@ -385,10 +351,6 @@ class TaskRunner:
             monotonic() - started
         )
 
-        # --------------------------------------------------------------
-        # Account creation year
-        # --------------------------------------------------------------
-
         created_at = user_node.get(
             "createdAt"
         )
@@ -411,10 +373,6 @@ class TaskRunner:
             self._emit()
             return None
 
-        # --------------------------------------------------------------
-        # Save result
-        # --------------------------------------------------------------
-
         now = datetime.now(
             timezone.utc
         ).isoformat()
@@ -426,9 +384,9 @@ class TaskRunner:
             "account_creation_year": created_year,
             "run_id": self.progress.run_id,
             "scraped_at": now,
+            "location": location,
         }
 
-        # Permanent master database.
         self.history.append_to_db(
             record
         )

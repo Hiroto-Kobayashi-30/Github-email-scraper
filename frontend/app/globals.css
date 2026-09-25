@@ -161,6 +161,7 @@ input:focus{
   transition:opacity .15s ease;
 }
 .download:hover{opacity:.75}
+.downloadList{display:flex;flex-direction:column;gap:4px}
 
 /* Table */
 .tableWrap{overflow:auto;max-height:300px}

@@ -1,50 +1,98 @@
-from db.history import HistoryDB, RUN_HEADER
+from db.history import HistoryDB, EXPORT_HEADER, EXPORT_BATCH_SIZE
 
 
-def test_batch_export_path_uses_short_date_location_count_layout(tmp_path, monkeypatch):
-    import db.history as history_module
-    from datetime import datetime
-
-    class FixedDateTime(datetime):
-        @classmethod
-        def now(cls):
-            return cls(2026, 9, 23, 12, 0, 0)
-
-    monkeypatch.setattr(history_module, "datetime", FixedDateTime)
+def test_create_run_exports_splits_into_batches(tmp_path):
     db = HistoryDB(tmp_path / 'db.csv', tmp_path / 'exports')
-    path = db.run_export_path('New York, NY', 20)
-    assert path.name == '09_23_New_York,_NY_20.CSV'
-    assert path.parent == tmp_path / 'exports'
-    assert path.exists()
+
+    records = [
+        {
+            'username': f'user{i}',
+            'email': f'user{i}@gmail.com',
+            'github_username': f'user{i}',
+            'account_creation_year': 2020,
+            'run_id': 'run-1',
+            'scraped_at': '2026-09-23T00:00:00+00:00',
+            'location': 'Brazil',
+        }
+        for i in range(45)
+    ]
+
+    paths = db.create_run_exports('Brazil', records, batch_size=20)
+
+    assert len(paths) == 3
+    assert len(paths[0].name) > 0
+
+    import csv
+    with paths[0].open('r', newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        assert reader.fieldnames == EXPORT_HEADER
+        rows = list(reader)
+        assert len(rows) == 20
+        assert rows[0]['github_username'] == 'user0'
+        assert rows[0]['gmail_address'] == 'user0@gmail.com'
+        assert rows[0]['username'] == 'user0'
+        assert rows[0]['location'] == 'Brazil'
+        assert rows[0]['account_creation_year'] == '2020'
+
+    with paths[1].open('r', newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+        assert len(rows) == 20
+
+    with paths[2].open('r', newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+        assert len(rows) == 5
 
 
-def test_next_batch_export_does_not_overwrite(tmp_path, monkeypatch):
-    import db.history as history_module
-    from datetime import datetime
-
-    class FixedDateTime(datetime):
-        @classmethod
-        def now(cls):
-            return cls(2026, 9, 23, 12, 0, 0)
-
-    monkeypatch.setattr(history_module, "datetime", FixedDateTime)
+def test_create_run_exports_empty_records(tmp_path):
     db = HistoryDB(tmp_path / 'db.csv', tmp_path / 'exports')
-    first = db.next_batch_export_path('Brazil', 20)
-    second = db.next_batch_export_path('Brazil', 20)
-    assert first.name == '09_23_Brazil_20.CSV'
-    assert second.name == '09_23_Brazil_20.CSV'
-    assert first == second
+    paths = db.create_run_exports('Brazil', [])
+    assert paths == []
 
 
-def test_db_is_permanent_and_run_file_is_appendable(tmp_path):
+def test_create_run_exports_exact_batch_size(tmp_path):
+    db = HistoryDB(tmp_path / 'db.csv', tmp_path / 'exports')
+    records = [
+        {
+            'username': f'user{i}',
+            'email': f'user{i}@gmail.com',
+            'github_username': f'user{i}',
+            'account_creation_year': 2020,
+            'run_id': 'run-1',
+            'scraped_at': '2026-09-23T00:00:00+00:00',
+            'location': 'Japan',
+        }
+        for i in range(20)
+    ]
+    paths = db.create_run_exports('Japan', records, batch_size=20)
+    assert len(paths) == 1
+
+    import csv
+    with paths[0].open('r', newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+        assert len(rows) == 20
+
+
+def test_db_is_permanent_and_includes_location(tmp_path):
     db = HistoryDB(tmp_path / 'db.csv', tmp_path / 'exports')
     record = {
         'username': 'alice', 'email': 'alice@gmail.com', 'github_username': 'alice',
         'account_creation_year': 2018,
-        'run_id': 'run-1', 'scraped_at': '2026-09-23T00:00:00+00:00'
+        'run_id': 'run-1', 'scraped_at': '2026-09-23T00:00:00+00:00',
+        'location': 'Tokyo',
     }
     db.append_to_db(record)
-    path = db.run_export_path('Brazil', 20)
-    db.append_to_run(path, record)
     assert db.total_count() == 1
-    assert path.read_text(encoding='utf-8').count('alice@gmail.com') == 1
+
+    records = db.recent_records(10)
+    assert records[0]['location'] == 'Tokyo'
+
+
+def test_export_header_fields():
+    assert EXPORT_HEADER == [
+        'github_username', 'gmail_address', 'username',
+        'location', 'account_creation_year',
+    ]
+
+
+def test_export_batch_size_is_20():
+    assert EXPORT_BATCH_SIZE == 20

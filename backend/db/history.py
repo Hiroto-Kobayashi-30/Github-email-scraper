@@ -1,4 +1,4 @@
-"""Append-only CSV history and unique per-run export files."""
+"""Append-only CSV history and per-run export files split into 20-entry batches."""
 import csv
 import re
 import threading
@@ -7,9 +7,15 @@ from pathlib import Path
 
 DB_HEADER = [
     "username", "email", "github_username",
-    "account_creation_year", "run_id", "scraped_at",
+    "account_creation_year", "run_id", "scraped_at", "location",
 ]
-RUN_HEADER = DB_HEADER
+
+EXPORT_HEADER = [
+    "github_username", "gmail_address", "username",
+    "location", "account_creation_year",
+]
+
+EXPORT_BATCH_SIZE = 20
 
 
 def _safe_slug(text: str) -> str:
@@ -34,7 +40,6 @@ class HistoryDB:
                 csv.writer(f).writerow(DB_HEADER)
             return
 
-        # Migrate the original 3-column db.csv without losing its history.
         with self.db_csv_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             existing_fields = reader.fieldnames or []
@@ -54,6 +59,7 @@ class HistoryDB:
                     "account_creation_year": row.get("account_creation_year", ""),
                     "run_id": row.get("run_id", "legacy"),
                     "scraped_at": row.get("scraped_at", ""),
+                    "location": row.get("location", ""),
                 })
         temp.replace(self.db_csv_path)
 
@@ -70,12 +76,6 @@ class HistoryDB:
             return max(0, sum(1 for _ in csv.reader(f)) - 1)
 
     def recent_records(self, limit: int = 25, offset: int = 0) -> list[dict]:
-        """Return recent records from the entire db.csv, newest first.
-
-        The file is read in full so older records are never ignored when
-        determining what is in the permanent history. ``offset`` is applied
-        only after reversing to newest-first order.
-        """
         if not self.db_csv_path.exists():
             return []
         with self._lock:
@@ -86,7 +86,6 @@ class HistoryDB:
         return rows[offset:offset + limit]
 
     def search_records(self, query: str, limit: int = 100) -> list[dict]:
-        """Case-insensitive substring search across username and email."""
         if not self.db_csv_path.exists():
             return []
         q = query.strip().lower()
@@ -105,11 +104,13 @@ class HistoryDB:
         return matched[:limit]
 
     def list_exports(self) -> list[dict]:
-        """List all export CSV files with relative paths and sizes."""
         exports: list[dict] = []
         if not self.exports_dir.exists():
             return exports
-        for path in sorted(self.exports_dir.rglob("*.csv"), reverse=True):
+        paths: list[Path] = []
+        paths.extend(self.exports_dir.rglob("*.csv"))
+        paths.extend(self.exports_dir.rglob("*.CSV"))
+        for path in sorted(paths, reverse=True):
             stat = path.stat()
             exports.append({
                 "path": str(path),
@@ -119,54 +120,49 @@ class HistoryDB:
             })
         return exports
 
-    def _export_folder(self) -> Path:
-        """Return the single permanent EXPORTS directory.
-
-        Batch files are intentionally kept flat so each completed batch is
-        easy to find and download.
-        """
-        self.exports_dir.mkdir(parents=True, exist_ok=True)
-        return self.exports_dir
-
-    def batch_export_path(self, location: str, batch_count: int) -> Path:
-        """Return a unique batch filename in EXPORTS.
-
-        Format: MM_DD_LOCATION_COUNT.CSV
-        The COUNT is the number of records contained in this batch file.
-        """
+    def _batch_export_path(self, location: str, batch_count: int, index: int = 1) -> Path:
         now = datetime.now()
         location_slug = _safe_slug(location)
-        base = f"{now.strftime('%m_%d')}_{location_slug}_{int(batch_count)}.CSV"
-        folder = self._export_folder()
+        date_part = now.strftime("%m_%d")
+        base = f"{date_part}_{location_slug}_{int(batch_count)}.csv"
+        folder = self.exports_dir
+        folder.mkdir(parents=True, exist_ok=True)
         path = folder / base
         if not path.exists():
             return path
-
-        # Never overwrite an earlier run with the same date/location/count.
-        # Keep the requested naming scheme and add a deterministic suffix only
-        # when a collision is unavoidable.
-        index = 2
+        suffix = 2
         while True:
-            candidate = folder / f"{now.strftime('%m_%d')}_{location_slug}_{int(batch_count)}_{index}.CSV"
+            candidate = folder / f"{date_part}_{location_slug}_{int(batch_count)}_{suffix}.csv"
             if not candidate.exists():
                 return candidate
-            index += 1
+            suffix += 1
 
-    def create_batch_export(self, location: str, batch_count: int) -> Path:
-        path = self.batch_export_path(location, batch_count)
-        with path.open("w", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=RUN_HEADER).writeheader()
-        return path
+    def create_run_exports(
+        self,
+        location: str,
+        records: list[dict],
+        batch_size: int = EXPORT_BATCH_SIZE,
+    ) -> list[Path]:
+        """Split completed run results into CSV files of ``batch_size`` entries each.
 
-    # Backward-compatible names used by older callers/tests.
-    def run_export_path(self, location: str, batch_count: int) -> Path:
-        return self.create_batch_export(location, batch_count)
-
-    def next_batch_export_path(self, location: str, batch_count: int, step: int = 20) -> Path:
-        return self.batch_export_path(location, batch_count)
-
-    def append_to_run(self, run_path: Path, record: dict) -> None:
-        with self._lock:
-            with run_path.open("a", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=RUN_HEADER).writerow(record)
-                f.flush()
+        Called once after scraping is finished. Returns the list of created
+        file paths. Each file uses the export header with fields:
+        github_username, gmail_address, username, location, account_creation_year.
+        """
+        paths: list[Path] = []
+        for i in range(0, len(records), batch_size):
+            chunk = records[i:i + batch_size]
+            path = self._batch_export_path(location, len(chunk))
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=EXPORT_HEADER)
+                writer.writeheader()
+                for record in chunk:
+                    writer.writerow({
+                        "github_username": record.get("github_username", ""),
+                        "gmail_address": record.get("email", ""),
+                        "username": record.get("username", ""),
+                        "location": record.get("location", location),
+                        "account_creation_year": record.get("account_creation_year", ""),
+                    })
+            paths.append(path)
+        return paths
